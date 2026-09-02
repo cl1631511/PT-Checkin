@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 import os
 import urllib.parse
+import re
 
 from cloakbrowser import launch_persistent_context
 
@@ -174,26 +175,19 @@ def wait_past_leichi(page, timeout=300) -> bool:
     return False
 
 
-# ── 代理辅助函数 ─────────────────────────────────────────────────────────────
+# ── 代理配置 ──────────────────────────────────────────────────────────────────
 
-def parse_proxy_url(proxy_url: str) -> dict | None:
+def build_cloak_proxy_config(proxy_url: str) -> dict | None:
     """
-    解析代理 URL，支持 HTTP/HTTPS/SOCKS5 代理。
+    构建 CloakBrowser 的代理配置。
     
-    格式:
-        http://user:pass@host:port
-        https://user:pass@host:port
-        socks5://user:pass@host:port
-        socks5h://user:pass@host:port  (socks5h 表示远程 DNS 解析)
-    
-    Returns:
-        dict: {'scheme': 'http'|'https'|'socks5', 'host': str, 'port': int, 'username': str, 'password': str}
-        None: 解析失败
+    CloakBrowser 的 proxy 参数支持:
+        - 字符串: "http://host:port" 或 "socks5://host:port"
+        - 字典: {"server": "host:port", "type": "socks5", "username": "...", "password": "..."}
     """
     if not proxy_url:
         return None
     
-    import re
     from urllib.parse import urlparse
     
     parsed = urlparse(proxy_url)
@@ -208,51 +202,23 @@ def parse_proxy_url(proxy_url: str) -> dict | None:
         print(f"    [!] 代理 URL 缺少 host 或 port: {proxy_url}")
         return None
     
-    result = {
-        'scheme': parsed.scheme,
-        'host': parsed.hostname,
-        'port': parsed.port,
-        'username': parsed.username,
-        'password': parsed.password,
-    }
+    # 方案1: 尝试使用字符串格式 (CloakBrowser 原生支持)
+    # 对于 SOCKS5，使用 socks5:// 格式
+    if parsed.scheme.startswith('socks5'):
+        # 如果有认证，使用 user:pass@host:port 格式
+        if parsed.username and parsed.password:
+            proxy_str = f"socks5://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}"
+        else:
+            proxy_str = f"socks5://{parsed.hostname}:{parsed.port}"
+        return proxy_str
     
-    return result
-
-
-def build_cloak_proxy_config(proxy_url: str) -> dict | None:
-    """
-    构建 CloakBrowser 的代理配置。
-    
-    CloakBrowser 的 proxy 参数支持:
-        - 字符串: "http://host:port" 或 "socks5://host:port"
-        - 字典: {"server": "host:port", "username": "...", "password": "..."}
-    """
-    if not proxy_url:
-        return None
-    
-    parsed = parse_proxy_url(proxy_url)
-    if not parsed:
-        return None
-    
-    # CloakBrowser 的 proxy 配置
-    # 对于 socks5，如果使用 socks5h 则保留 hostname
-    server = f"{parsed['host']}:{parsed['port']}"
-    
+    # HTTP/HTTPS 代理使用字典格式（带认证支持）
     proxy_config = {
-        "server": server,
+        "server": f"{parsed.hostname}:{parsed.port}",
     }
-    
-    # SOCKS5 代理需要指定类型
-    if parsed['scheme'].startswith('socks5'):
-        proxy_config["type"] = "socks5"
-        # socks5h 使用远程 DNS 解析
-        if parsed['scheme'] == 'socks5h':
-            proxy_config["remote_dns"] = True
-    
-    # 添加认证信息
-    if parsed.get('username') and parsed.get('password'):
-        proxy_config["username"] = parsed['username']
-        proxy_config["password"] = parsed['password']
+    if parsed.username and parsed.password:
+        proxy_config["username"] = parsed.username
+        proxy_config["password"] = parsed.password
     
     return proxy_config
 
@@ -281,15 +247,14 @@ def send_bark_notification(title: str, body: str, is_critical: bool = False) -> 
     proxy_url = os.getenv("PROXY_URL")
     proxies = None
     if proxy_url:
-        parsed = parse_proxy_url(proxy_url)
-        if parsed and parsed['scheme'] in ['http', 'https']:
-            # 只有 HTTP/HTTPS 代理支持 requests 库
+        # 只有 HTTP/HTTPS 代理支持 requests 库
+        if proxy_url.startswith(('http://', 'https://')):
             proxy_dict = {
                 'http': proxy_url,
                 'https': proxy_url,
             }
             proxies = proxy_dict
-            print(f"    [*] Bark 通知使用代理: {proxy_url}")
+            print(f"    [*] Bark 通知使用代理")
     
     try:
         # Bark API 格式: https://api.day.app/{key}/{title}/{body}
@@ -741,23 +706,23 @@ def process_site(site_config: dict) -> bool:
 
     # 从环境变量读取代理配置（选填）
     proxy_url = os.getenv("PROXY_URL")
-    proxy_config = None
     
     if proxy_url:
-        proxy_config = build_cloak_proxy_config(proxy_url)
-        if proxy_config:
-            print(f"    [*] 使用代理: {proxy_url}")
-            # 打印代理信息（隐藏密码）
-            proxy_display = proxy_url
-            if '@' in proxy_url:
-                # 隐藏密码
-                import re
-                proxy_display = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', proxy_url)
-            print(f"    [*] 代理配置: {proxy_display}")
-        else:
-            print(f"    [*] 代理解析失败，使用直连")
+        # 显示代理信息（隐藏密码）
+        proxy_display = proxy_url
+        # 隐藏密码部分
+        proxy_display = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', proxy_display)
+        print(f"    [*] 使用代理: {proxy_display}")
     else:
         print("    [*] 未配置代理，使用直连")
+
+    # 构建代理配置
+    proxy_config = None
+    if proxy_url:
+        proxy_config = build_cloak_proxy_config(proxy_url)
+        if not proxy_config:
+            print("    [*] 代理解析失败，使用直连")
+            proxy_url = None
 
     # 自动签到站点列表（使用 Cookie 直接签到，跳过登录检查）
     auto_sites = ["piggo", "hdkyl", "hitpt"]
@@ -788,9 +753,10 @@ def process_site(site_config: dict) -> bool:
         ] + extra_args,
     }
     
-    # 添加代理配置
+    # 添加代理配置（字符串格式）
     if proxy_config:
         launch_args["proxy"] = proxy_config
+        print(f"    [*] 代理已配置: {proxy_config if isinstance(proxy_config, str) else proxy_config.get('server', 'unknown')}")
     
     context = launch_persistent_context(**launch_args)
     page = context.new_page()
