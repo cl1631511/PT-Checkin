@@ -174,6 +174,89 @@ def wait_past_leichi(page, timeout=300) -> bool:
     return False
 
 
+# ── 代理辅助函数 ─────────────────────────────────────────────────────────────
+
+def parse_proxy_url(proxy_url: str) -> dict | None:
+    """
+    解析代理 URL，支持 HTTP/HTTPS/SOCKS5 代理。
+    
+    格式:
+        http://user:pass@host:port
+        https://user:pass@host:port
+        socks5://user:pass@host:port
+        socks5h://user:pass@host:port  (socks5h 表示远程 DNS 解析)
+    
+    Returns:
+        dict: {'scheme': 'http'|'https'|'socks5', 'host': str, 'port': int, 'username': str, 'password': str}
+        None: 解析失败
+    """
+    if not proxy_url:
+        return None
+    
+    import re
+    from urllib.parse import urlparse
+    
+    parsed = urlparse(proxy_url)
+    
+    # 支持的代理协议
+    schemes = ['http', 'https', 'socks5', 'socks5h']
+    if parsed.scheme not in schemes:
+        print(f"    [!] 不支持的代理协议: {parsed.scheme}，支持: {schemes}")
+        return None
+    
+    if not parsed.hostname or not parsed.port:
+        print(f"    [!] 代理 URL 缺少 host 或 port: {proxy_url}")
+        return None
+    
+    result = {
+        'scheme': parsed.scheme,
+        'host': parsed.hostname,
+        'port': parsed.port,
+        'username': parsed.username,
+        'password': parsed.password,
+    }
+    
+    return result
+
+
+def build_cloak_proxy_config(proxy_url: str) -> dict | None:
+    """
+    构建 CloakBrowser 的代理配置。
+    
+    CloakBrowser 的 proxy 参数支持:
+        - 字符串: "http://host:port" 或 "socks5://host:port"
+        - 字典: {"server": "host:port", "username": "...", "password": "..."}
+    """
+    if not proxy_url:
+        return None
+    
+    parsed = parse_proxy_url(proxy_url)
+    if not parsed:
+        return None
+    
+    # CloakBrowser 的 proxy 配置
+    # 对于 socks5，如果使用 socks5h 则保留 hostname
+    server = f"{parsed['host']}:{parsed['port']}"
+    
+    proxy_config = {
+        "server": server,
+    }
+    
+    # SOCKS5 代理需要指定类型
+    if parsed['scheme'].startswith('socks5'):
+        proxy_config["type"] = "socks5"
+        # socks5h 使用远程 DNS 解析
+        if parsed['scheme'] == 'socks5h':
+            proxy_config["remote_dns"] = True
+    
+    # 添加认证信息
+    if parsed.get('username') and parsed.get('password'):
+        proxy_config["username"] = parsed['username']
+        proxy_config["password"] = parsed['password']
+    
+    return proxy_config
+
+
 # ── Bark 通知 ──────────────────────────────────────────────────────────────────
 
 def send_bark_notification(title: str, body: str, is_critical: bool = False) -> bool:
@@ -193,6 +276,20 @@ def send_bark_notification(title: str, body: str, is_critical: bool = False) -> 
     if not bark_key:
         print("    [!] 未配置 BARK_KEY 环境变量，跳过通知")
         return False
+    
+    # 检查是否需要通过代理发送通知
+    proxy_url = os.getenv("PROXY_URL")
+    proxies = None
+    if proxy_url:
+        parsed = parse_proxy_url(proxy_url)
+        if parsed and parsed['scheme'] in ['http', 'https']:
+            # 只有 HTTP/HTTPS 代理支持 requests 库
+            proxy_dict = {
+                'http': proxy_url,
+                'https': proxy_url,
+            }
+            proxies = proxy_dict
+            print(f"    [*] Bark 通知使用代理: {proxy_url}")
     
     try:
         # Bark API 格式: https://api.day.app/{key}/{title}/{body}
@@ -218,7 +315,7 @@ def send_bark_notification(title: str, body: str, is_critical: bool = False) -> 
             params["level"] = "active"
         
         # 发送请求
-        response = requests.get(base_url, params=params, timeout=10)
+        response = requests.get(base_url, params=params, timeout=10, proxies=proxies)
         
         if response.status_code == 200:
             print("    [+] Bark 通知发送成功")
@@ -644,8 +741,21 @@ def process_site(site_config: dict) -> bool:
 
     # 从环境变量读取代理配置（选填）
     proxy_url = os.getenv("PROXY_URL")
+    proxy_config = None
+    
     if proxy_url:
-        print(f"    [*] 使用代理: {proxy_url}")
+        proxy_config = build_cloak_proxy_config(proxy_url)
+        if proxy_config:
+            print(f"    [*] 使用代理: {proxy_url}")
+            # 打印代理信息（隐藏密码）
+            proxy_display = proxy_url
+            if '@' in proxy_url:
+                # 隐藏密码
+                import re
+                proxy_display = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', proxy_url)
+            print(f"    [*] 代理配置: {proxy_display}")
+        else:
+            print(f"    [*] 代理解析失败，使用直连")
     else:
         print("    [*] 未配置代理，使用直连")
 
@@ -658,17 +768,17 @@ def process_site(site_config: dict) -> bool:
         ]
         print(f"    [*] {name} 特殊模式：启用雷池WAF兼容，使用Cookie直接签到")
 
-    context = launch_persistent_context(
-        user_data_dir=get_profile_dir(name),
-        headless=False,
-        proxy=proxy_url if proxy_url else None,
-        geoip=True if proxy_url else False,
-        locale="zh-CN",
-        timezone="Asia/Shanghai",
-        humanize=True,
-        human_preset="careful",
-        viewport={"width": 1920, "height": 1080},
-        args=[
+    # 构建 launch 参数
+    launch_args = {
+        "user_data_dir": get_profile_dir(name),
+        "headless": False,
+        "geoip": True if proxy_url else False,
+        "locale": "zh-CN",
+        "timezone": "Asia/Shanghai",
+        "humanize": True,
+        "human_preset": "careful",
+        "viewport": {"width": 1920, "height": 1080},
+        "args": [
             "--disable-features=TrustedTypes",
             f"--fingerprint=checkin_{name}",
             "--fingerprint-noise=false",
@@ -676,7 +786,13 @@ def process_site(site_config: dict) -> bool:
             "--window-size=1920,1080",
             "--start-maximized",
         ] + extra_args,
-    )
+    }
+    
+    # 添加代理配置
+    if proxy_config:
+        launch_args["proxy"] = proxy_config
+    
+    context = launch_persistent_context(**launch_args)
     page = context.new_page()
 
     try:
