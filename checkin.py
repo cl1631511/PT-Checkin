@@ -12,6 +12,7 @@ from pathlib import Path
 import os
 import urllib.parse
 import re
+import socket
 
 from cloakbrowser import launch_persistent_context
 
@@ -177,7 +178,7 @@ def wait_past_leichi(page, timeout=300) -> bool:
 
 # ── 代理配置 ──────────────────────────────────────────────────────────────────
 
-def build_cloak_proxy_config(proxy_url: str) -> dict | None:
+def build_cloak_proxy_config(proxy_url: str) -> dict | str | None:
     """
     构建 CloakBrowser 的代理配置。
     
@@ -202,17 +203,14 @@ def build_cloak_proxy_config(proxy_url: str) -> dict | None:
         print(f"    [!] 代理 URL 缺少 host 或 port: {proxy_url}")
         return None
     
-    # 方案1: 尝试使用字符串格式 (CloakBrowser 原生支持)
-    # 对于 SOCKS5，使用 socks5:// 格式
+    # SOCKS5 代理返回字符串格式（CloakBrowser 原生支持）
     if parsed.scheme.startswith('socks5'):
-        # 如果有认证，使用 user:pass@host:port 格式
         if parsed.username and parsed.password:
-            proxy_str = f"socks5://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}"
+            return f"socks5://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}"
         else:
-            proxy_str = f"socks5://{parsed.hostname}:{parsed.port}"
-        return proxy_str
+            return f"socks5://{parsed.hostname}:{parsed.port}"
     
-    # HTTP/HTTPS 代理使用字典格式（带认证支持）
+    # HTTP/HTTPS 代理使用字典格式
     proxy_config = {
         "server": f"{parsed.hostname}:{parsed.port}",
     }
@@ -221,6 +219,162 @@ def build_cloak_proxy_config(proxy_url: str) -> dict | None:
         proxy_config["password"] = parsed.password
     
     return proxy_config
+
+
+def test_proxy(proxy_url: str, timeout: int = 10, retries: int = 3) -> tuple[bool, str]:
+    """
+    测试代理是否可用。
+    
+    Args:
+        proxy_url: 代理 URL
+        timeout: 超时时间（秒）
+        retries: 重试次数
+    
+    Returns:
+        (是否可用, 测试结果描述)
+    """
+    if not proxy_url:
+        return False, "代理 URL 为空"
+    
+    from urllib.parse import urlparse
+    
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname or not parsed.port:
+        return False, "代理 URL 格式无效"
+    
+    # 测试目标：使用一个稳定的网站
+    test_url = "https://www.cloudflare.com"
+    
+    # 根据协议选择测试方法
+    if parsed.scheme.startswith('socks5'):
+        return _test_socks5_proxy(parsed, timeout, retries)
+    elif parsed.scheme in ['http', 'https']:
+        return _test_http_proxy(proxy_url, test_url, timeout, retries)
+    else:
+        return False, f"不支持的代理协议: {parsed.scheme}"
+
+
+def _test_socks5_proxy(parsed, timeout: int, retries: int) -> tuple[bool, str]:
+    """测试 SOCKS5 代理是否可用"""
+    import socks
+    
+    for attempt in range(retries):
+        try:
+            # 设置 SOCKS5 代理
+            if parsed.username and parsed.password:
+                socks.set_default_proxy(
+                    socks.SOCKS5,
+                    parsed.hostname,
+                    parsed.port,
+                    username=parsed.username,
+                    password=parsed.password
+                )
+            else:
+                socks.set_default_proxy(
+                    socks.SOCKS5,
+                    parsed.hostname,
+                    parsed.port
+                )
+            
+            # 替换 socket 创建
+            original_socket = socket.socket
+            socket.socket = socks.socksocket
+            
+            try:
+                # 测试连接
+                import urllib.request
+                
+                # 创建请求
+                req = urllib.request.Request(
+                    "https://www.cloudflare.com",
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+                
+                # 发送请求（使用代理）
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = resp.getcode()
+                    if 200 <= status < 400:
+                        return True, f"测试成功 (状态码: {status}, 尝试 {attempt + 1}/{retries})"
+                    else:
+                        return False, f"状态码异常: {status}"
+                        
+            except urllib.error.URLError as e:
+                error_msg = str(e)
+                if attempt < retries - 1:
+                    print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
+                    time.sleep(2)
+                    continue
+                else:
+                    return False, f"连接失败: {error_msg}"
+            except socket.error as e:
+                error_msg = str(e)
+                if attempt < retries - 1:
+                    print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
+                    time.sleep(2)
+                    continue
+                else:
+                    return False, f"socket 错误: {error_msg}"
+            except Exception as e:
+                error_msg = str(e)
+                if attempt < retries - 1:
+                    print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
+                    time.sleep(2)
+                    continue
+                else:
+                    return False, f"未知错误: {error_msg}"
+            finally:
+                # 恢复原始 socket
+                socket.socket = original_socket
+                
+        except ImportError:
+            return False, "socks 模块未安装，请安装: pip install PySocks"
+        except Exception as e:
+            if attempt < retries - 1:
+                print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {e}，重试...")
+                time.sleep(2)
+                continue
+            else:
+                return False, f"测试异常: {e}"
+    
+    return False, f"重试 {retries} 次后仍然失败"
+
+
+def _test_http_proxy(proxy_url: str, test_url: str, timeout: int, retries: int) -> tuple[bool, str]:
+    """测试 HTTP/HTTPS 代理是否可用"""
+    import requests
+    
+    proxies = {
+        'http': proxy_url,
+        'https': proxy_url,
+    }
+    
+    for attempt in range(retries):
+        try:
+            response = requests.get(test_url, proxies=proxies, timeout=timeout, headers={
+                "User-Agent": "Mozilla/5.0"
+            })
+            status = response.status_code
+            if 200 <= status < 400:
+                return True, f"测试成功 (状态码: {status}, 尝试 {attempt + 1}/{retries})"
+            else:
+                return False, f"状态码异常: {status}"
+        except requests.exceptions.RequestException as e:
+            error_msg = str(e)
+            if attempt < retries - 1:
+                print(f"    [*] HTTP 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
+                time.sleep(2)
+                continue
+            else:
+                return False, f"请求异常: {error_msg}"
+        except Exception as e:
+            if attempt < retries - 1:
+                print(f"    [*] HTTP 代理测试失败 ({attempt + 1}/{retries}): {e}，重试...")
+                time.sleep(2)
+                continue
+            else:
+                return False, f"未知错误: {e}"
+    
+    return False, f"重试 {retries} 次后仍然失败"
 
 
 # ── Bark 通知 ──────────────────────────────────────────────────────────────────
@@ -246,15 +400,13 @@ def send_bark_notification(title: str, body: str, is_critical: bool = False) -> 
     # 检查是否需要通过代理发送通知
     proxy_url = os.getenv("PROXY_URL")
     proxies = None
-    if proxy_url:
-        # 只有 HTTP/HTTPS 代理支持 requests 库
-        if proxy_url.startswith(('http://', 'https://')):
-            proxy_dict = {
-                'http': proxy_url,
-                'https': proxy_url,
-            }
-            proxies = proxy_dict
-            print(f"    [*] Bark 通知使用代理")
+    if proxy_url and proxy_url.startswith(('http://', 'https://')):
+        proxy_dict = {
+            'http': proxy_url,
+            'https': proxy_url,
+        }
+        proxies = proxy_dict
+        print(f"    [*] Bark 通知使用代理")
     
     try:
         # Bark API 格式: https://api.day.app/{key}/{title}/{body}
@@ -706,23 +858,37 @@ def process_site(site_config: dict) -> bool:
 
     # 从环境变量读取代理配置（选填）
     proxy_url = os.getenv("PROXY_URL")
+    use_proxy = False
+    final_proxy_url = None
+    proxy_test_result = None
     
     if proxy_url:
         # 显示代理信息（隐藏密码）
         proxy_display = proxy_url
-        # 隐藏密码部分
         proxy_display = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', proxy_display)
-        print(f"    [*] 使用代理: {proxy_display}")
+        print(f"    [*] 检测到代理配置: {proxy_display}")
+        
+        # 测试代理是否可用
+        print(f"    [*] 正在测试代理连通性...")
+        proxy_test_result = test_proxy(proxy_url, timeout=10, retries=3)
+        
+        if proxy_test_result[0]:
+            use_proxy = True
+            final_proxy_url = proxy_url
+            print(f"    [✓] 代理测试通过: {proxy_test_result[1]}")
+        else:
+            print(f"    [✗] 代理测试失败: {proxy_test_result[1]}")
+            print(f"    [*] 将使用直连（不使用代理）进行签到")
     else:
         print("    [*] 未配置代理，使用直连")
 
     # 构建代理配置
     proxy_config = None
-    if proxy_url:
-        proxy_config = build_cloak_proxy_config(proxy_url)
+    if use_proxy and final_proxy_url:
+        proxy_config = build_cloak_proxy_config(final_proxy_url)
         if not proxy_config:
             print("    [*] 代理解析失败，使用直连")
-            proxy_url = None
+            use_proxy = False
 
     # 自动签到站点列表（使用 Cookie 直接签到，跳过登录检查）
     auto_sites = ["piggo", "hdkyl", "hitpt"]
@@ -737,7 +903,7 @@ def process_site(site_config: dict) -> bool:
     launch_args = {
         "user_data_dir": get_profile_dir(name),
         "headless": False,
-        "geoip": True if proxy_url else False,
+        "geoip": True if use_proxy else False,
         "locale": "zh-CN",
         "timezone": "Asia/Shanghai",
         "humanize": True,
@@ -753,10 +919,10 @@ def process_site(site_config: dict) -> bool:
         ] + extra_args,
     }
     
-    # 添加代理配置（字符串格式）
-    if proxy_config:
+    # 添加代理配置（如果可用）
+    if use_proxy and proxy_config:
         launch_args["proxy"] = proxy_config
-        print(f"    [*] 代理已配置: {proxy_config if isinstance(proxy_config, str) else proxy_config.get('server', 'unknown')}")
+        print(f"    [*] 使用代理进行签到")
     
     context = launch_persistent_context(**launch_args)
     page = context.new_page()
