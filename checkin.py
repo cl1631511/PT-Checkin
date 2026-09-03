@@ -394,10 +394,29 @@ def mask_proxy_url(proxy_url: str) -> str:
     
     result = proxy_url
     
-    # 1. 隐藏认证信息 (user:pass@)
+    # 1. 先隐藏主机名
+    def mask_hostname(host):
+        parts = host.split('.')
+        if len(parts) >= 2:
+            tld = parts[-1]
+            return f"***.{tld}"
+        else:
+            return "***"
+    
+    # 匹配并替换主机名：://(用户名:密码@)?主机名
+    def replace_host(match):
+        auth = match.group(1) or ""  # 认证信息 (user:pass@)
+        host = match.group(2)        # 主机名
+        full = match.group(0)
+        suffix = full[len(auth) + len(host) + 3:]  # +3 是 ://
+        return f"://{auth}{mask_hostname(host)}{suffix}"
+    
+    result = re.sub(r'://([^:@]+:[^@]+@)?([^:/@]+)', replace_host, result)
+    
+    # 2. 隐藏认证信息 (user:pass@)
     result = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', result)
     
-    # 2. 隐藏端口号（只显示前2位，后面用 * 代替）
+    # 3. 隐藏端口号
     def mask_port(match):
         port = match.group(1)
         if len(port) <= 2:
@@ -406,29 +425,6 @@ def mask_proxy_url(proxy_url: str) -> str:
             return f":{port[:2]}{'*' * (len(port) - 2)}"
     
     result = re.sub(r':(\d+)(?=/|$)', mask_port, result)
-    
-    # 3. 完全隐藏主机名（只保留顶级域名）
-    def mask_hostname(match):
-        host = match.group(1)
-        parts = host.split('.')
-        if len(parts) >= 2:
-            # 只保留顶级域名，其他部分用 *** 代替
-            tld = parts[-1]
-            if len(parts) > 2:
-                return f"***.{tld}"
-            else:
-                return f"***.{tld}"
-        else:
-            return "***"
-    
-    # 匹配主机名（在协议和端口/路径之间）
-    def replace_host(match):
-        prefix = match.group(0)[:3]  # ://
-        host = match.group(1)
-        suffix = match.group(0)[len(host) + 3:]  # 后面的部分
-        return f"{prefix}{mask_hostname(match)}{suffix}"
-    
-    result = re.sub(r'://([^:/@]+)(?::|@|$)', replace_host, result)
     
     return result
 
