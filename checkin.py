@@ -294,7 +294,7 @@ def _test_socks5_proxy(parsed, timeout: int, retries: int) -> tuple[bool, str]:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     status = resp.getcode()
                     if 200 <= status < 400:
-                        return True, f"测试成功 (状态码: {status}, 尝试 {attempt + 1}/{retries})"
+                        return True, f"测试成功 (状态码: {status})"
                     else:
                         return False, f"状态码异常: {status}"
                         
@@ -355,7 +355,7 @@ def _test_http_proxy(proxy_url: str, test_url: str, timeout: int, retries: int) 
             })
             status = response.status_code
             if 200 <= status < 400:
-                return True, f"测试成功 (状态码: {status}, 尝试 {attempt + 1}/{retries})"
+                return True, f"测试成功 (状态码: {status})"
             else:
                 return False, f"状态码异常: {status}"
         except requests.exceptions.RequestException as e:
@@ -381,7 +381,7 @@ def _test_http_proxy(proxy_url: str, test_url: str, timeout: int, retries: int) 
 
 def mask_proxy_url(proxy_url: str) -> str:
     """
-    隐藏代理 URL 中的敏感信息（用户名、密码、端口、主机名）
+    隐藏代理 URL 中的敏感信息（完全隐藏主机名）
     
     Args:
         proxy_url: 原始代理 URL
@@ -407,25 +407,21 @@ def mask_proxy_url(proxy_url: str) -> str:
     
     result = re.sub(r':(\d+)(?=/|$)', mask_port, result)
     
-    # 3. 隐藏主机名（保留顶级域名和每部分的第一个字符）
+    # 3. 完全隐藏主机名（只保留顶级域名）
     def mask_hostname(match):
         host = match.group(1)
         parts = host.split('.')
-        masked_parts = []
-        for i, part in enumerate(parts):
-            # 如果是最后一部分（顶级域名），完全保留
-            if i == len(parts) - 1:
-                masked_parts.append(part)
+        if len(parts) >= 2:
+            # 只保留顶级域名，其他部分用 *** 代替
+            tld = parts[-1]
+            if len(parts) > 2:
+                return f"***.{tld}"
             else:
-                # 其他部分只保留第一个字符
-                if part:
-                    masked_parts.append(part[0] + '*' * (len(part) - 1))
-                else:
-                    masked_parts.append('*')
-        return '.'.join(masked_parts)
+                return f"***.{tld}"
+        else:
+            return "***"
     
     # 匹配主机名（在协议和端口/路径之间）
-    # 匹配 ://hostname 或 ://hostname:port 或 ://user:pass@hostname
     def replace_host(match):
         prefix = match.group(0)[:3]  # ://
         host = match.group(1)
@@ -466,7 +462,6 @@ def send_bark_notification(title: str, body: str, is_critical: bool = False) -> 
             'https': proxy_url,
         }
         proxies = proxy_dict
-        print(f"    [*] Bark 通知使用代理")
     
     try:
         # Bark API 格式: https://api.day.app/{key}/{title}/{body}
@@ -486,7 +481,7 @@ def send_bark_notification(title: str, body: str, is_critical: bool = False) -> 
         # 如果是紧急通知，添加 critical 和 volume 参数
         if is_critical:
             params["level"] = "critical"
-            params["volume"] = "0"  # 静音紧急通知（只震动不响铃）
+            params["volume"] = "0"
             print("    [*] 发送紧急通知（签到失败）")
         else:
             params["level"] = "active"
@@ -910,44 +905,11 @@ def check_logged_in(page, site_config: dict) -> bool:
 
 # ── 单站点处理 ────────────────────────────────────────────────────────────────
 
-def process_site(site_config: dict) -> bool:
+def process_site(site_config: dict, proxy_config: dict | str | None = None, use_proxy: bool = False) -> bool:
     name = site_config["name"]
     print(f"\n{'=' * 50}")
     print(f"  站点：{name} ({site_config['url']})")
     print(f"{'=' * 50}")
-
-    # 从环境变量读取代理配置（选填）
-    proxy_url = os.getenv("PROXY_URL")
-    use_proxy = False
-    final_proxy_url = None
-    proxy_test_result = None
-    
-    if proxy_url:
-        # 显示代理信息（隐藏敏感内容）
-        proxy_display = mask_proxy_url(proxy_url)
-        print(f"    [*] 检测到代理配置: {proxy_display}")
-        
-        # 测试代理是否可用
-        print(f"    [*] 正在测试代理连通性...")
-        proxy_test_result = test_proxy(proxy_url, timeout=10, retries=3)
-        
-        if proxy_test_result[0]:
-            use_proxy = True
-            final_proxy_url = proxy_url
-            print(f"    [✓] 代理测试通过: {proxy_test_result[1]}")
-        else:
-            print(f"    [✗] 代理测试失败: {proxy_test_result[1]}")
-            print(f"    [*] 将使用直连（不使用代理）进行签到")
-    else:
-        print("    [*] 未配置代理，使用直连")
-
-    # 构建代理配置
-    proxy_config = None
-    if use_proxy and final_proxy_url:
-        proxy_config = build_cloak_proxy_config(final_proxy_url)
-        if not proxy_config:
-            print("    [*] 代理解析失败，使用直连")
-            use_proxy = False
 
     # 自动签到站点列表（使用 Cookie 直接签到，跳过登录检查）
     auto_sites = ["piggo", "hdkyl", "hitpt"]
@@ -1043,10 +1005,39 @@ def main():
     print("  Cloak Browser 自动签到助手")
     print("=" * 50)
 
+    # ── 全局代理配置（只检测一次） ──────────────────────────────────────────
+    proxy_url = os.getenv("PROXY_URL")
+    use_proxy = False
+    proxy_config = None
+    proxy_test_result = None
+    
+    if proxy_url:
+        # 显示代理信息（隐藏敏感内容）
+        proxy_display = mask_proxy_url(proxy_url)
+        print(f"    [*] 检测到代理配置: {proxy_display}")
+        
+        # 测试代理是否可用（只测试一次）
+        print(f"    [*] 正在测试代理连通性...")
+        proxy_test_result = test_proxy(proxy_url, timeout=10, retries=3)
+        
+        if proxy_test_result[0]:
+            use_proxy = True
+            proxy_config = build_cloak_proxy_config(proxy_url)
+            if proxy_config:
+                print(f"    [✓] 代理测试通过: {proxy_test_result[1]}")
+            else:
+                print(f"    [✗] 代理解析失败，使用直连")
+                use_proxy = False
+        else:
+            print(f"    [✗] 代理测试失败: {proxy_test_result[1]}")
+            print(f"    [*] 将使用直连（不使用代理）进行签到")
+    else:
+        print("    [*] 未配置代理，使用直连")
+
     results: dict[str, str] = {}
     for site in sites:
         try:
-            ok = process_site(site)
+            ok = process_site(site, proxy_config, use_proxy)
             results[site["name"]] = "OK" if ok else "FAIL"
         except Exception as e:
             results[site["name"]] = f"ERR: {e}"
