@@ -377,6 +377,50 @@ def _test_http_proxy(proxy_url: str, test_url: str, timeout: int, retries: int) 
     return False, f"重试 {retries} 次后仍然失败"
 
 
+# ── 代理显示辅助函数 ─────────────────────────────────────────────────────────
+
+def mask_proxy_url(proxy_url: str) -> str:
+    """
+    隐藏代理 URL 中的敏感信息（用户名、密码、端口、主机名）
+    
+    Args:
+        proxy_url: 原始代理 URL
+    
+    Returns:
+        隐藏后的代理 URL
+    """
+    if not proxy_url:
+        return ""
+    
+    result = proxy_url
+    
+    # 1. 隐藏认证信息 (user:pass@)
+    result = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', result)
+    
+    # 2. 隐藏端口号（只显示前2位，后面用 * 代替）
+    def mask_port(match):
+        port = match.group(1)
+        if len(port) <= 2:
+            return f":{port[0]}{'*' * len(port)}"
+        else:
+            return f":{port[:2]}{'*' * (len(port) - 2)}"
+    
+    result = re.sub(r':(\d+)(?=/|$)', mask_port, result)
+    
+    # 3. 隐藏主机名中间部分（保留前4位和后4位）
+    def mask_hostname(match):
+        host = match.group(1)
+        if len(host) <= 6:
+            return host[:2] + '***' + host[-2:] if len(host) > 4 else host
+        else:
+            return host[:4] + '***' + host[-4:]
+    
+    # 匹配主机名（在协议和端口之间）
+    result = re.sub(r'://([^:@]+)(?::|@)', lambda m: f"://{mask_hostname(m)}", result)
+    
+    return result
+
+
 # ── Bark 通知 ──────────────────────────────────────────────────────────────────
 
 def send_bark_notification(title: str, body: str, is_critical: bool = False) -> bool:
@@ -863,9 +907,8 @@ def process_site(site_config: dict) -> bool:
     proxy_test_result = None
     
     if proxy_url:
-        # 显示代理信息（隐藏密码）
-        proxy_display = proxy_url
-        proxy_display = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', proxy_display)
+        # 显示代理信息（隐藏敏感内容）
+        proxy_display = mask_proxy_url(proxy_url)
         print(f"    [*] 检测到代理配置: {proxy_display}")
         
         # 测试代理是否可用
