@@ -407,16 +407,32 @@ def mask_proxy_url(proxy_url: str) -> str:
     
     result = re.sub(r':(\d+)(?=/|$)', mask_port, result)
     
-    # 3. 隐藏主机名中间部分（保留前4位和后4位）
+    # 3. 隐藏主机名（保留顶级域名和每部分的第一个字符）
     def mask_hostname(match):
         host = match.group(1)
-        if len(host) <= 6:
-            return host[:2] + '***' + host[-2:] if len(host) > 4 else host
-        else:
-            return host[:4] + '***' + host[-4:]
+        parts = host.split('.')
+        masked_parts = []
+        for i, part in enumerate(parts):
+            # 如果是最后一部分（顶级域名），完全保留
+            if i == len(parts) - 1:
+                masked_parts.append(part)
+            else:
+                # 其他部分只保留第一个字符
+                if part:
+                    masked_parts.append(part[0] + '*' * (len(part) - 1))
+                else:
+                    masked_parts.append('*')
+        return '.'.join(masked_parts)
     
-    # 匹配主机名（在协议和端口之间）
-    result = re.sub(r'://([^:@]+)(?::|@)', lambda m: f"://{mask_hostname(m)}", result)
+    # 匹配主机名（在协议和端口/路径之间）
+    # 匹配 ://hostname 或 ://hostname:port 或 ://user:pass@hostname
+    def replace_host(match):
+        prefix = match.group(0)[:3]  # ://
+        host = match.group(1)
+        suffix = match.group(0)[len(host) + 3:]  # 后面的部分
+        return f"{prefix}{mask_hostname(match)}{suffix}"
+    
+    result = re.sub(r'://([^:/@]+)(?::|@|$)', replace_host, result)
     
     return result
 
