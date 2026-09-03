@@ -1,0 +1,28 @@
+name: Test Selenium Audiences Check-in
+
+on:
+  workflow_dispatch:  # 手动触发测试
+
+jobs:
+  test-selenium:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements_selenium.txt
+          # 安装浏览器驱动 (SeleniumBase UC 模式需要)
+          seleniumbase install chromedriver
+
+      - name: Run audiences check-in test
+        env:
+          AUDIENCES_COOKIE: ${{ secrets.AUDIENCES_COOKIE }}
+        run: |
+          python checkin_audiences_selenium.py
