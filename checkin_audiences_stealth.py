@@ -6,7 +6,19 @@ import re
 import asyncio
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+
+# playwright-stealth 的正确导入方式
+try:
+    from playwright_stealth import stealth_async
+except ImportError:
+    # 如果 playwright-stealth 版本不同，尝试备用导入
+    try:
+        from playwright_stealth import stealth
+        stealth_async = stealth
+    except ImportError:
+        # 如果都没有，定义一个空函数
+        async def stealth_async(page):
+            return page
 
 # --- 配置 ---
 PROXY_URL = os.environ.get("PROXY_URL")
@@ -24,6 +36,8 @@ def parse_proxy(proxy_url: str):
     proxy = {
         "server": f"{parsed.hostname}:{parsed.port}",
     }
+    if parsed.scheme.startswith('socks5'):
+        proxy["type"] = "socks5"
     if parsed.username and parsed.password:
         proxy["username"] = parsed.username
         proxy["password"] = parsed.password
@@ -34,7 +48,29 @@ def mask_proxy_url(proxy_url: str) -> str:
         return ""
     result = proxy_url
     result = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', result)
-    result = re.sub(r':(\d+)(?=/|$)', lambda m: f":{m.group(1)[:2]}***", result)
+    def mask_hostname(match):
+        host = match.group(1)
+        parts = host.split('.')
+        if len(parts) >= 2:
+            tld = parts[-1]
+            return f"***.{tld}"
+        else:
+            return "***"
+    def replace_host(match):
+        auth = match.group(1) or ""
+        host = match.group(2)
+        full = match.group(0)
+        suffix = full[len(auth) + len(host) + 3:]
+        return f"://{auth}{mask_hostname(match)}{suffix}"
+    result = re.sub(r'://([^:@]+:[^@]+@)?([^:/@]+)', replace_host, result)
+    result = re.sub(r'://[^:]+:[^@]+@', r'://***:***@', result)
+    def mask_port(match):
+        port = match.group(1)
+        if len(port) <= 2:
+            return f":{port[0]}{'*' * len(port)}"
+        else:
+            return f":{port[:2]}{'*' * (len(port) - 2)}"
+    result = re.sub(r':(\d+)(?=/|$)', mask_port, result)
     return result
 
 
@@ -62,13 +98,14 @@ async def main():
         print("    [*] 未配置代理，使用直连")
 
     async with async_playwright() as p:
-        # 启动浏览器（使用有头模式，在 Actions 的虚拟显示器中运行）
+        # 启动浏览器
         browser = await p.chromium.launch(
-            headless=False,  # 在 Actions 中用 xvfb-run 运行
+            headless=False,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--no-sandbox",
+                "--disable-dev-shm-usage",
             ]
         )
         
@@ -82,10 +119,14 @@ async def main():
         
         page = await context.new_page()
         
-        # 应用 stealth 插件
-        await stealth_async(page)
+        # 应用 stealth 插件（如果可用）
+        try:
+            await stealth_async(page)
+            print("    [*] Stealth 已启用")
+        except Exception as e:
+            print(f"    [*] Stealth 启用失败: {e}")
 
-        # 1. 访问首页，建立会话
+        # 1. 访问首页
         print(f"    [*] 访问首页: {SITE_URL}")
         await page.goto(SITE_URL, wait_until="networkidle")
         await asyncio.sleep(2)
@@ -108,7 +149,6 @@ async def main():
                     print(f"    [*] Cookie 注入失败: {name} - {e}")
         print(f"    [*] 成功注入 {cookie_count} 个 Cookie")
 
-        # 刷新使 Cookie 生效
         await page.reload()
         await asyncio.sleep(2)
 
@@ -117,30 +157,26 @@ async def main():
         await page.goto(CHECKIN_URL, wait_until="networkidle")
         await asyncio.sleep(3)
 
-        # 检查当前 URL
-        current_url = page.url
-        print(f"    [*] 当前 URL: {current_url}")
+        print(f"    [*] 当前 URL: {page.url}")
 
-        # 4. 等待 Turnstile 自动完成
+        # 4. 等待 Turnstile
         print("    [*] 等待 Turnstile 验证完成...")
         
-        # 检查 Turnstile 容器是否存在
         has_turnstile = await page.locator(".cf-turnstile").count() > 0
         if has_turnstile:
-            print("    [*] 检测到 Turnstile 容器，等待验证...")
+            print("    [*] 检测到 Turnstile 容器")
             
             # 等待 Turnstile iframe 加载
             try:
                 await page.wait_for_selector("iframe[src*='turnstile']", timeout=15000)
-                print("    [*] Turnstile iframe 已加载，等待验证通过...")
+                print("    [*] Turnstile iframe 已加载")
             except:
-                print("    [*] Turnstile iframe 未检测到，可能已通过")
+                print("    [*] Turnstile iframe 未检测到")
             
-            # 等待 Turnstile token 出现或 iframe 消失
+            # 等待验证完成
             max_wait = 120
             for i in range(max_wait):
                 await asyncio.sleep(2)
-                # 检查 token
                 token = await page.evaluate("""
                     () => {
                         const el = document.querySelector('input[name="cf-token"]');
@@ -150,7 +186,6 @@ async def main():
                 if token:
                     print(f"    [*] Turnstile token 已生成 (等待 {i*2} 秒)")
                     break
-                # 检查 iframe 是否消失
                 iframe_count = await page.locator("iframe[src*='turnstile']").count()
                 if iframe_count == 0 and i > 2:
                     print(f"    [*] Turnstile iframe 已消失 (等待 {i*2} 秒)")
@@ -162,11 +197,10 @@ async def main():
         else:
             print("    [*] 未检测到 Turnstile 容器")
 
-        # 5. 检查页面是否自动提交
+        # 5. 检查结果
         print("    [*] 检查签到状态...")
         await asyncio.sleep(3)
         
-        # 获取页面内容
         page_text = await page.content()
         page_title = await page.title()
         current_url = page.url
@@ -174,7 +208,6 @@ async def main():
         print(f"    [DEBUG] 当前 URL: {current_url}")
         print(f"    [DEBUG] 页面标题: {page_title}")
 
-        # 保存页面源码
         with open("audiences_page.html", "w", encoding="utf-8") as f:
             f.write(page_text)
         await page.screenshot(path="audiences_page.png")
@@ -197,11 +230,9 @@ async def main():
                     print(f"    [-] 签到失败: {kw}")
                     break
             else:
-                # 如果页面包含"签到"按钮，尝试点击
                 if "签到" in page_text and "已签到" not in page_text:
                     print("    [*] 页面显示未签到，尝试点击签到按钮...")
                     try:
-                        # 查找并点击签到按钮
                         clicked = await page.evaluate("""
                             () => {
                                 const elements = document.querySelectorAll('a, button, input[type="submit"]');
@@ -228,8 +259,7 @@ async def main():
                         print(f"    [*] 点击签到按钮失败: {e}")
                 
                 if not check_success:
-                    # 检查是否在签到页但未签到
-                    if "attendance" in current_url and ("签到" in page_title or "Attendance" in page_title):
+                    if "attendance" in current_url:
                         print("    [WARN] 页面正常加载，但未检测到签到成功关键词")
                         print("    [WARN] 可能 Turnstile 未通过或签到已满")
                     else:
