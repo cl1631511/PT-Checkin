@@ -10,16 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # 只在定时触发时随机延迟 0-60 分钟
-      - name: Random delay before check-in (scheduled runs only)
-        if: github.event_name == 'schedule'
-        run: |
-          DELAY_SECONDS=$((RANDOM % 3601))
-          DELAY_MINUTES=$((DELAY_SECONDS / 60))
-          DELAY_REMAINDER=$((DELAY_SECONDS % 60))
-          echo "⏰ 随机延迟 ${DELAY_MINUTES} 分 ${DELAY_REMAINDER} 秒后开始签到..."
-          sleep $DELAY_SECONDS
-
       - name: Checkout code
         uses: actions/checkout@v4
 
