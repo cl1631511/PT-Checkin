@@ -622,6 +622,58 @@ def login(page, site_config: dict) -> bool:
 
 # ── 签到 ──────────────────────────────────────────────────────────────────────
 
+# 页面出现过这些词，才算真的签到过（或今天不用再签）
+SUCCESS_KEYWORDS = ["已经签到", "已签到", "已經簽到", "已簽到", "签到成功", "簽到成功", "今日已签到", "重复签到", "请勿重复打卡"]
+# 站点明确告诉我们没签成
+FAIL_KEYWORDS = ["验证失败", "验证错误", "请重新验证", "验证码错误", "请先完成验证", "签到失败"]
+
+
+def classify_page(page_text: str, url_path: str = "", title: str = "", http_status: int = 0) -> tuple[str, str]:
+    """把一页正文判成 success / fail / waf / blocked / login / unknown 之一。
+
+    只有正面证据才给 success；unknown 表示这页上没有任何签到结果，调用方必须当作
+    "没签成"处理，不能当作成功。第二项是判据，只含关键词、路径、状态码和长度，不含页面原文。
+    """
+    t = page_text or ""
+    low = (t + " " + (title or "")).lower()
+    for kw in SUCCESS_KEYWORDS:
+        if kw in t:
+            return "success", f"关键词「{kw}」"
+    for kw in FAIL_KEYWORDS:
+        if kw in t:
+            return "fail", f"关键词「{kw}」"
+    if http_status in (401,):
+        return "login", f"HTTP {http_status}，登录态已失效"
+    if http_status in (403, 429, 503):
+        return "blocked", f"HTTP {http_status}，被拦截"
+    if "雷池" in t:
+        return "waf", "仍停在雷池WAF验证页"
+    if "just a moment" in low or "attention required" in low or "have been blocked" in low:
+        return "blocked", "停在 Cloudflare 拦截/验证页"
+    if url_path.endswith("login.php"):
+        return "login", f"被送回登录页（{url_path}），Cookie 已失效或不足"
+    if "用户名" in t and "密码" in t:
+        return "login", "页面上是登录表单，Cookie 已失效或不足"
+    return "unknown", f"页面上没有任何签到结果证据（正文 {len(t)} 字符）"
+
+
+def url_path_of(page) -> str:
+    try:
+        return urllib.parse.urlparse(page.url).path
+    except Exception:
+        return ""
+
+
+def await_page_text(page, tries: int = 4) -> str:
+    """页面正在跳转时读 innerText 会抛异常；等它稳定后把正文读出来，读不到返回空串。"""
+    for _ in range(tries):
+        try:
+            return page.evaluate("() => document.body ? document.body.innerText : ''")
+        except Exception:
+            time.sleep(3)
+    return ""
+
+
 def do_checkin(page, site_config: dict) -> bool:
     site_url = site_config["url"]
     checkin_url = f"{site_url}{site_config['checkin_path']}"
@@ -631,11 +683,14 @@ def do_checkin(page, site_config: dict) -> bool:
     print(f"    [*] 访问签到页面 {checkin_url} ...")
     
     # 访问页面，等待网络空闲（确保页面完全加载，包括可能的跳转）
+    http_status = 0
     try:
-        page.goto(checkin_url, wait_until="networkidle", timeout=60000)
+        resp = page.goto(checkin_url, wait_until="networkidle", timeout=60000)
+        http_status = resp.status if resp is not None else 0
     except Exception:
         # 如果 networkidle 超时，改用 domcontentloaded
-        page.goto(checkin_url, wait_until="domcontentloaded", timeout=60000)
+        resp = page.goto(checkin_url, wait_until="domcontentloaded", timeout=60000)
+        http_status = resp.status if resp is not None else 0
     
     # 等待页面稳定，给跳转足够时间
     time.sleep(8)
@@ -658,15 +713,12 @@ def do_checkin(page, site_config: dict) -> bool:
                 continue
             raise e
     else:
-        # 3次尝试都失败，但页面可能已经跳转完成，尝试用另一种方式获取
-        print("    [*] 页面跳转完成，尝试检查当前页面状态...")
-        time.sleep(3)
-        try:
-            page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
-        except Exception:
-            # 如果还是失败，但页面已经跳转，视为签到成功
-            print("    [OK] 页面跳转完成，签到成功")
-            return True
+        # 3次尝试都失败，页面可能仍在跳转，再读一次
+        print("    [*] 页面持续跳转，再读一次当前状态...")
+        page_text = await_page_text(page)
+        if not page_text:
+            print("    [-] 读不到页面正文，无法确认签到结果")
+            return False
     
     # 检查是否被雷池WAF拦截（如果当前页面是雷池验证页面）
     if "雷池WAF" in page_text or "安全检测能力由雷池WAF驱动" in page_text:
@@ -685,9 +737,12 @@ def do_checkin(page, site_config: dict) -> bool:
             page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
         except Exception as e:
             if "Execution context was destroyed" in str(e):
-                print("    [OK] 页面跳转完成，签到成功")
-                return True
-            raise e
+                page_text = await_page_text(page)
+                if not page_text:
+                    print("    [-] 雷池通过后页面仍读不到，无法确认签到结果")
+                    return False
+            else:
+                raise e
         print(f"    [DEBUG] 跳转后页面内容长度: {len(page_text)}")
 
     # 等待 Cloudflare 验证完成
@@ -701,30 +756,36 @@ def do_checkin(page, site_config: dict) -> bool:
         page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
     except Exception as e:
         if "Execution context was destroyed" in str(e):
-            print("    [OK] 页面跳转完成，签到成功")
-            return True
-        raise e
-    
-    print(f"    [DEBUG] 页面内容长度: {len(page_text)}")
-    
-    # 检查是否已签到（签到成功关键词）
-    success_keywords = ["已经签到", "已签到", "已經簽到", "已簽到", "签到成功", "簽到成功", "今日已签到", "重复签到", "请勿重复打卡"]
-    for kw in success_keywords:
-        if kw in page_text:
-            print(f"    [OK] 今日已签到 (检测到关键词: {kw})")
-            return True
-    
-    # 检查失败关键词
-    fail_keywords = ["验证失败", "验证错误", "请重新验证", "验证码错误", "请先完成验证", "签到失败"]
-    for kw in fail_keywords:
-        if kw in page_text:
-            print(f"    [-] 签到失败: {kw}")
-            return False
+            page_text = await_page_text(page)
+            if not page_text:
+                print("    [-] 页面持续跳转，读不到签到结果")
+                return False
+        else:
+            raise e
 
-    # auto模式：页面加载成功且没有失败信息，视为签到成功
-    if checkin_type == "auto":
-        print("    [OK] 签到页面已加载（自动签到模式），签到成功")
+    verdict, reason = classify_page(page_text, url_path_of(page), page.title(), http_status)
+    print(f"    [DEBUG] HTTP {http_status} / 页面内容长度: {len(page_text)} / 判定: {verdict}")
+
+    if verdict == "success":
+        print(f"    [OK] 签到状态已确认（{reason}）")
         return True
+    if verdict != "unknown":
+        print(f"    [-] 签到未成功: {reason}")
+        return False
+
+    # auto 模式过去在这里直接算成功——那是假的：这一页上没有任何签到证据。
+    # 现在真去提交一次，签没签成以页面回话为准。
+    if checkin_type == "auto":
+        print("    [*] 未见签到证据，尝试提交签到表单...")
+        if _checkin_form(page) or _checkin_link_click(page):
+            return True
+        verdict2, reason2 = classify_page(await_page_text(page), url_path_of(page),
+                                         page.title(), http_status)
+        if verdict2 == "success":
+            print(f"    [OK] 提交后确认已签到（{reason2}）")
+            return True
+        print(f"    [-] 提交后仍未确认签到（判定: {verdict2}，{reason2}）")
+        return False
 
     # 其他签到模式
     if checkin_type == "turnstile":
@@ -1068,6 +1129,11 @@ def main():
             body = "\n".join(details)
         
         send_bark_notification(title, body, is_critical)
+
+    # 有站点没签成就要让 Actions 红灯：过去进程总是 0 退出，"实际没签到"在
+    # Actions 页面上也是一片绿，只有 Bark 那一条会响。
+    if fail_count > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
