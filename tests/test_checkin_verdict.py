@@ -5,6 +5,7 @@
 只需 import checkin.py；顶层的 cloakbrowser 用空桩替掉，不需要真浏览器。
 """
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -343,6 +344,88 @@ _w3_lines = [l for l in _buf.getvalue().splitlines() if "提交后" in l]
 ok(_w3_result is False, "warm-up 后提交仍无回话 → FAIL")
 ok(_w3_lines and "468" not in _w3_lines[0],
    f"重试后判读跟着新状态码走，不再顶着第一次的 468（{_w3_lines}）")
+
+# ===================== 6. 没有代理就别直连 piggo =====================
+print("\n[6] 代理缺席时的站点取舍")
+_pig = checkin.TEMPLATES["piggo"]
+ok(_pig.get("require_proxy") is True, "piggo 模板标记为必须走代理")
+ok(not checkin.TEMPLATES["hdkyl"].get("require_proxy")
+   and not checkin.TEMPLATES["hitpt"].get("require_proxy"),
+   "hdkyl / hitpt 没有这个标记 —— 代理挂了它们照样直连签（只收紧 piggo）")
+_reason = checkin.skip_for_missing_proxy(_pig, False)
+ok(bool(_reason) and "代理" in _reason, f"没代理时 piggo 给出跳过原因（{_reason}）")
+ok(checkin.skip_for_missing_proxy(_pig, True) is None, "有代理时 piggo 照常签到")
+ok(checkin.skip_for_missing_proxy(checkin.TEMPLATES["hdkyl"], False) is None,
+   "没代理时 hdkyl 不被跳过（不扩大范围）")
+ok(checkin.skip_for_missing_proxy({"name": "新站"}, False) is None,
+   "没写 require_proxy 的站点默认照旧直连（不改变老行为）")
+ok("skip_for_missing_proxy(site, use_proxy)" in _src
+   and 'results[site["name"]] = f"SKIP: {skip_reason}"' in _src,
+   "main() 的签到循环真的调了跳过判定，不是只写了个函数没人用")
+
+# ===================== 7. 代理挂的那一轮实际怎么跑 =====================
+print("\n[7] 代理不可用时 main() 的整轮行为")
+_orig = (checkin.load_config, checkin.test_proxy, checkin.process_site,
+         checkin.send_bark_notification, sys.argv, os.environ.get("PROXY_URL"))
+_ran, _barks = [], []
+
+
+def _fake_main_round(proxy_url):
+    _ran.clear()
+    _barks.clear()
+    checkin.load_config = lambda: {"sites": [
+        {"name": "piggo", "username": "u", "password": "p"},
+        {"name": "hdkyl", "username": "u", "password": "p"},
+    ]}
+    checkin.test_proxy = lambda url, timeout=10, retries=3: (False, "握手失败")
+    checkin.process_site = lambda site, cfg=None, use_proxy=False: (_ran.append(site["name"]), True)[1]
+    checkin.send_bark_notification = lambda title, body, critical=False: _barks.append((title, body, critical))
+    sys.argv = ["checkin.py"]
+    if proxy_url:
+        os.environ["PROXY_URL"] = proxy_url
+    else:
+        os.environ.pop("PROXY_URL", None)
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        try:
+            checkin.main()
+            code = 0
+        except SystemExit as e:
+            code = e.code
+    return code, _buf.getvalue()
+
+
+_code, _out = _fake_main_round("socks5://u:p@127.0.0.1:1080")
+ok(_ran == ["hdkyl"], f"代理不可用：只真跑了不该走代理的站点（{_ran}）")
+ok("piggo：需要代理" in _out, "日志里点名 piggo 这一轮被跳过，而不是悄悄漏签")
+ok(_code == 1, f"跳过 piggo 也算「未完成」→ 非 0 退出（{_code}）")
+ok(_barks and _barks[0][2] is True and "未完成" in _barks[0][0],
+   f"推送是 critical 且标题说未完成（{_barks[0][0] if _barks else None}）")
+
+_code, _out = _fake_main_round(None)
+ok(_ran == ["hdkyl"] and "piggo：需要代理" in _out,
+   f"连 PROXY_URL 都没配也一样跳过 piggo、其余照跑（{_ran}）")
+
+_code, _out = _fake_main_round("socks5://u:p@127.0.0.1:1080")
+checkin.test_proxy = lambda url, timeout=10, retries=3: (True, "握手成功")
+_ran.clear()
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    try:
+        checkin.main()
+        _code2 = 0
+    except SystemExit as e:
+        _code2 = e.code
+ok(_ran == ["piggo", "hdkyl"] and _code2 == 0,
+   f"代理可用时 piggo 照常签（{_ran}，退出码 {_code2}）")
+
+(checkin.load_config, checkin.test_proxy, checkin.process_site,
+ checkin.send_bark_notification) = _orig[:4]
+sys.argv = _orig[4]
+if _orig[5] is None:
+    os.environ.pop("PROXY_URL", None)
+else:
+    os.environ["PROXY_URL"] = _orig[5]
 
 print(f"\n{_passed}/{_passed + _failed} 通过")
 if _failed:

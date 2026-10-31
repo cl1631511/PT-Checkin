@@ -49,6 +49,9 @@ TEMPLATES: dict[str, dict] = {
         "login_path": "/login.php",
         "checkin_path": "/attendance.php",
         "checkin_type": "auto",
+        # piggo 绑了异地登录检测：从 Azure 直连的 IP 去动这份会话，站点会锁号
+        # （2026-10-31 就这么锁过一次）。没有可用代理时宁可这一轮不签。
+        "require_proxy": True,
         "login_captcha": False,
         "login_fields": {"username": "username", "password": "password"},
     },
@@ -1235,6 +1238,13 @@ def process_site(site_config: dict, proxy_config: dict | str | None = None, use_
 
 # ── 主函数 ────────────────────────────────────────────────────────────────────
 
+def skip_for_missing_proxy(site: dict, use_proxy: bool) -> str | None:
+    """站点要求必须走代理、而这一轮没有代理时，返回跳过原因；None 表示照常签到。"""
+    if site.get("require_proxy") and not use_proxy:
+        return "需要代理，本轮代理不可用（直连会被站点判异地登录并锁号）"
+    return None
+
+
 def main():
     config = load_config()
     sites = build_sites(config)
@@ -1278,16 +1288,27 @@ def main():
             if proxy_config:
                 print(f"    [✓] 代理可用: {proxy_test_result[1]}")
             else:
-                print(f"    [✗] 代理解析失败，使用直连")
+                print(f"    [✗] 代理解析失败")
                 use_proxy = False
         else:
             print(f"    [✗] 代理不可用: {proxy_test_result[1]}")
-            print(f"    [*] 将使用直连（不使用代理）进行签到")
     else:
-        print("    [*] 未配置代理，使用直连")
+        print("    [*] 未配置代理")
+
+    if not use_proxy:
+        strict = [s["name"] for s in sites if s.get("require_proxy")]
+        if strict:
+            print(f"    [*] 其余站点走直连；{'、'.join(strict)} 这一轮跳过（直连会被站点判异地登录）")
+        else:
+            print("    [*] 全部站点走直连")
 
     results: dict[str, str] = {}
     for site in sites:
+        skip_reason = skip_for_missing_proxy(site, use_proxy)
+        if skip_reason:
+            print(f"    [!] {site['name']}：{skip_reason}")
+            results[site["name"]] = f"SKIP: {skip_reason}"
+            continue
         try:
             ok = process_site(site, proxy_config, use_proxy)
             results[site["name"]] = "OK" if ok else "FAIL"
@@ -1304,7 +1325,7 @@ def main():
     details = []
     
     for name, status in results.items():
-        icon = "✓" if status == "OK" else "✗"
+        icon = "✓" if status == "OK" else ("!" if status.startswith("SKIP") else "✗")
         print(f"  {icon} {name}: {status}")
         if status == "OK":
             success_count += 1
@@ -1317,7 +1338,7 @@ def main():
         is_critical = (fail_count > 0)
         
         if is_critical:
-            title = f" PT签到异常 - 失败 {fail_count} 个站点"
+            title = f" PT签到异常 - {fail_count} 个站点未完成"
             body = "\n".join(details)
         else:
             title = f" PT签到完成 - 全部成功 ({success_count} 个站点)"
