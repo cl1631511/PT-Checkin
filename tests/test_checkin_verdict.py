@@ -312,10 +312,19 @@ ok("203.0.113.9" not in _d6, "frame 域名里混了完整 IP 照样被抠掉")
 ok("表单动作=/ajax.php" in _d6, "表单提交到哪个路径也报出来（只有路径，没有查询串）")
 ok("iframe域名" not in _diag and "表单动作" not in _diag,
    "没有 frame、没有表单时不多打出空字段")
+# 又跑一轮：piggo 连「iframe域名」这栏都没打出来 —— 两个 frame 当时还没有 src（JS 后建的）。
+# 域名问不出来就問尺寸：滑块 frame 有固定大小，占位/广告 frame 是 0x0。
+_d7 = checkin._diag_page(FakePage("请完成安全验证后再签到", title="猪猪 - Powered by NexusPHP",
+                                  shape=dict(_PIGGO_SEEN, iframes=2,
+                                             frame_dims="301x102,0x0")), _Resp(200))
+ok("iframe尺寸=301x102,0x0" in _d7,
+   f"没 src 的 frame 靠尺寸分「真闸」和「占位」（{_d7}）")
+ok("iframe尺寸" not in _d6 and "iframe尺寸" not in _diag,
+   "读不到尺寸时不硬打这一栏")
 # 桩只回一个现成的 dict，所以 _PAGE_SHAPE_JS 里的选择器本身在这儿测不到（真浏览器才有）；
 # 但「JS 返回的键」和「诊断行读的键」两边各写一遍，改一边忘另一边是这里最可能的错，必须钉住
 import re as _re
-_js_keys = set(_re.findall(r"\b(\w+)\s*:\s*(?:q|href|urls)\(", checkin._PAGE_SHAPE_JS))
+_js_keys = set(_re.findall(r"\b(\w+)\s*:\s*(?:q|href|urls|dims)\(", checkin._PAGE_SHAPE_JS))
 _printed = set(_re.findall(r'sh\.get\(["\'](\w+)["\']', (ROOT / "checkin.py").read_text(encoding="utf-8")))
 ok(_js_keys == _printed and {"iframes", "verify_widgets", "buttons", "att_form"} <= _js_keys,
    f"形状脚本返回的键 == 诊断行读的键（JS={sorted(_js_keys)} 打印={sorted(_printed)}）")

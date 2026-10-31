@@ -703,6 +703,8 @@ _PAGE_SHAPE_JS = """() => {
         try { const u = new URL(e[key] || '', location.href); return key === 'src' ? u.host : u.pathname; }
         catch (err) { return ''; }
     }).filter(Boolean).slice(0, 4).join(',');
+    const dims = (sel) => Array.from(document.querySelectorAll(sel))
+        .map(e => Math.round(e.offsetWidth) + 'x' + Math.round(e.offsetHeight)).join(',');
     return {
         forms: q('form'), inputs: q('input'), links: q('a'),
         att_form: q('#attendance') + q('form[action*="attendance"]'),
@@ -713,10 +715,13 @@ _PAGE_SHAPE_JS = """() => {
         pass_inputs: q('input[type="password"]'),
         iframes: q('iframe'),
         frame_hosts: urls('iframe', 'src'),
+        frame_dims: dims('iframe'),
         form_actions: urls('form', 'action'),
         verify_widgets: q('.cf-turnstile') + q('[id*="cf-challenge"]')
                         + q('input[name*="turnstile"]') + q('input[name*="challenge-response"]')
-                        + q('[class*="challenge"]') + q('[id*="seccode"]'),
+                        + q('[class*="challenge"]') + q('[id*="seccode"]')
+                        + q('[id*="safeline"]') + q('[class*="safeline"]')
+                        + q('[id*="captcha"]') + q('canvas'),
         buttons: q('button') + q('input[type="submit"]')
     };
 }"""
@@ -773,9 +778,12 @@ def _diag_page(page, resp) -> str:
                 sh.get("member_links", "?"), sh.get("iframes", "?"),
                 sh.get("verify_widgets", "?"), sh.get("buttons", "?")))
         frames = str(sh.get("frame_hosts", ""))[:120]
+        dims = str(sh.get("frame_dims", ""))[:80]
         acts = str(sh.get("form_actions", ""))[:80]
         if frames:
             parts.append(f"iframe域名={mask_personal(frames)}")
+        if dims:
+            parts.append(f"iframe尺寸={mask_personal(dims)}")
         if acts:
             parts.append(f"表单动作={mask_personal(acts)}")
         if sh.get("captcha") or sh.get("pass_inputs"):
