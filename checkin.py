@@ -688,23 +688,30 @@ def await_page_text(page, tries: int = 4) -> str:
 _BLOCK_MARKERS = ["雷池", "safeline", "waf", "防火墙", "拦截", "blocked", "forbidden",
                   "拒绝", "cloudflare", "just a moment", "captcha", "机器人"]
 # 这一页到底是干什么用的：签到表单？还是要先过站点自己那道验证？只看这些词在不在场。
-_CLUE_WORDS = ["安全码", "验证码", "滑块", "人机", "点击", "刷新", "输入", "签到", "补签",
+_CLUE_WORDS = ["安全码", "验证码", "验证", "滑块", "人机", "点击", "刷新", "输入", "签到", "补签",
                "连续", "魔力", "排名", "登录", "登陆", "用户名", "密码", "已签到", "尚未", "错误",
                "出错", "抱歉", "无法", "暂时", "关闭", "退出", "注册", "重新登录", "权限", "维护"]
 
 # 页面的骨架：数个数、不抄内容。判据只能说「这页没签到证据」，这些数能说出为什么。
+# piggo 这一站压根没有签到按钮 —— 过掉验证之后站点自己就签了，所以「验证部件在不在」
+# 才是关键形状，光数表单看不出来。
 _PAGE_SHAPE_JS = """() => {
     const q = (s) => document.querySelectorAll(s).length;
     const href = (frag) => Array.from(document.querySelectorAll('a'))
         .filter(a => (a.href || '').indexOf(frag) >= 0).length;
     return {
-        forms: q('form'), inputs: q('input'), links: q('a'), imgs: q('img'),
+        forms: q('form'), inputs: q('input'), links: q('a'),
         att_form: q('#attendance') + q('form[action*="attendance"]'),
         login_links: href('login.php'),
         member_links: href('logout') + href('userdetails'),
         captcha: q('input[name*="code"]') + q('input[id*="code"]')
                  + q('img[src*="imagecode"]') + q('img[src*="captcha"]'),
-        pass_inputs: q('input[type="password"]')
+        pass_inputs: q('input[type="password"]'),
+        iframes: q('iframe'),
+        verify_widgets: q('.cf-turnstile') + q('[id*="cf-challenge"]')
+                        + q('input[name*="turnstile"]') + q('input[name*="challenge-response"]')
+                        + q('[class*="challenge"]') + q('[id*="seccode"]'),
+        buttons: q('button') + q('input[type="submit"]')
     };
 }"""
 
@@ -753,10 +760,12 @@ def _diag_page(page, resp) -> str:
     except Exception:
         sh = {}
     if isinstance(sh, dict) and sh:
-        parts.append("页面形状=表单{}/输入{}/链接{}/签到表单{}/登录链接{}/会员链接{}".format(
-            sh.get("forms", "?"), sh.get("inputs", "?"), sh.get("links", "?"),
-            sh.get("att_form", "?"), sh.get("login_links", "?"),
-            sh.get("member_links", "?")))
+        parts.append(
+            "页面形状=表单{}/输入{}/链接{}/签到表单{}/登录链接{}/会员链接{}/iframe{}/验证部件{}/按钮{}".format(
+                sh.get("forms", "?"), sh.get("inputs", "?"), sh.get("links", "?"),
+                sh.get("att_form", "?"), sh.get("login_links", "?"),
+                sh.get("member_links", "?"), sh.get("iframes", "?"),
+                sh.get("verify_widgets", "?"), sh.get("buttons", "?")))
         if sh.get("captcha") or sh.get("pass_inputs"):
             parts.append(f"验证码框={sh.get('captcha', 0)} 密码框={sh.get('pass_inputs', 0)}")
     return " / ".join(parts)

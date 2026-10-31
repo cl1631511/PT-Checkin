@@ -138,8 +138,9 @@ class FakePage:
     def evaluate(self, script):
         if "login_links" in script:      # _PAGE_SHAPE_JS：只数个数，不抄内容
             return self.shape if self.shape is not None else {
-                "forms": 0, "inputs": 0, "links": 0, "imgs": 0, "att_form": 0,
-                "login_links": 0, "member_links": 0, "captcha": 0, "pass_inputs": 0}
+                "forms": 0, "inputs": 0, "links": 0, "att_form": 0,
+                "login_links": 0, "member_links": 0, "captcha": 0, "pass_inputs": 0,
+                "iframes": 0, "verify_widgets": 0, "buttons": 0}
         if "getElementById('attendance')" in script:
             self.submit_calls += 1
             if not self.has_form:
@@ -270,22 +271,44 @@ ok("你好" not in _diag and "今日签到已得 15 魔力" not in _diag,
 ok("safeline" in _diag.lower(), "响应头 Server 进诊断行 —— 就是它告诉我们挡的是哪家 WAF")
 ok("403 Forbidden" in _diag, "页面标题进诊断行（标题只有站点自己的措辞）")
 ok("拦截词=forbidden" in _diag, "拦截词按白名单报出")
-ok("线索词=验证码、输入、签到、魔力" in _diag,
+ok("线索词=验证码、验证、输入、签到、魔力" in _diag,
    f"线索词报出这一页是干什么的（{_diag}）")
 ok("正文=" in _diag and f"{len(_LEAK_BODY)}字符" in _diag, "只报正文长度")
-ok("页面形状=表单0/输入0/链接0/签到表单0/登录链接0/会员链接0" in _diag,
+ok("页面形状=表单0/输入0/链接0/签到表单0/登录链接0/会员链接0/iframe0/验证部件0/按钮0" in _diag,
    f"页面骨架的计数进诊断行（{_diag}）")
-# piggo 这两轮真实遇到的形状：有 layout、有「登录」入口、没有签到表单、没有会员链接
-_LOGGED_OUT = {"forms": 1, "inputs": 0, "links": 40, "imgs": 3, "att_form": 0,
-               "login_links": 1, "member_links": 0, "captcha": 0, "pass_inputs": 0}
+# piggo 这几轮真实回的形状：整站导航在、登录态在（会员链接1），但没有签到表单、没有结果措辞
+_PIGGO_SEEN = {"forms": 1, "inputs": 2, "links": 86, "att_form": 0,
+               "login_links": 0, "member_links": 1, "captcha": 0, "pass_inputs": 0,
+               "iframes": 0, "verify_widgets": 0, "buttons": 1}
 _d2 = checkin._diag_page(FakePage(_LEAK_BODY, status=200, title="猪猪 - Powered by NexusPHP",
-                                  shape=_LOGGED_OUT), _Resp(200, {"server": "cloudflare"}))
-ok("登录链接1/会员链接0" in _d2 and "签到表单0" in _d2,
-   f"「按登录态看是游客页」这个形状能直接从日志读出来（{_d2}）")
+                                  shape=_PIGGO_SEEN), _Resp(200, {"server": "cloudflare"}))
+ok("签到表单0/登录链接0/会员链接1/iframe0/验证部件0/按钮1" in _d2,
+   f"piggo 那张页子的形状能直接从日志读出来（{_d2}）")
 ok("cl1631511" not in _d2, "带形状计数照样不抄正文")
-_d3 = checkin._diag_page(FakePage(_LEAK_BODY, shape=dict(_LOGGED_OUT, captcha=1,
+# 反过来：卡在验证部件上时，日志要一眼看得出「部件在场」，这才值得去点它
+_d4 = checkin._diag_page(FakePage("请完成安全验证后再签到", title="安全验证",
+                                  shape=dict(_PIGGO_SEEN, iframes=2, verify_widgets=1)),
+                         _Resp(200))
+ok("iframe2/验证部件1" in _d4, f"验证部件个数进诊断行（{_d4}）")
+ok("签到" in _d4.split("线索词=")[1].split(" /")[0],
+   "整段线索词只列白名单词，页面上的其它字一个不抄")
+ok("验证" in _d4.split("线索词=")[1].split(" /")[0],
+   "页面上有「验证」措辞时线索词里要出现它（决定下一步是点部件还是查 cookie）")
+# 游客页（有 login.php 链接、没有会员链接）是另一种形状，别和上面混为一谈
+_d5 = checkin._diag_page(FakePage(_LEAK_BODY, shape=dict(_PIGGO_SEEN, login_links=1,
+                                                          member_links=0)), _Resp(200))
+ok("登录链接1/会员链接0" in _d5, "「按登录态看是游客页」日志分得开 —— 那种情况才该换 cookie")
+_d3 = checkin._diag_page(FakePage(_LEAK_BODY, shape=dict(_PIGGO_SEEN, captcha=1,
                                                          pass_inputs=1)), _Resp(200))
 ok("验证码框=1 密码框=1" in _d3, "有验证码框/密码框时单独点名（决定要不要走人工）")
+# 桩只回一个现成的 dict，所以 _PAGE_SHAPE_JS 里的选择器本身在这儿测不到（真浏览器才有）；
+# 但「JS 返回的键」和「诊断行读的键」两边各写一遍，改一边忘另一边是这里最可能的错，必须钉住
+import re as _re
+_js_keys = set(_re.findall(r"\b(\w+)\s*:\s*(?:q|href)\(", checkin._PAGE_SHAPE_JS))
+_printed = set(_re.findall(r'sh\.get\(["\'](\w+)["\']', (ROOT / "checkin.py").read_text(encoding="utf-8")))
+ok(_js_keys == _printed and {"iframes", "verify_widgets", "buttons", "att_form"} <= _js_keys,
+   f"形状脚本返回的键 == 诊断行读的键（JS={sorted(_js_keys)} 打印={sorted(_printed)}）")
+
 _empty_diag = checkin._diag_page(FakePage(""), _Resp(None))
 ok("Server=无" in _empty_diag and "拦截词=无" in _empty_diag and "线索词=无" in _empty_diag,
    "读不到响应头/标记词时诊断行照样能出，不抛异常")
