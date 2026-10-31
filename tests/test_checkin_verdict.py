@@ -253,19 +253,23 @@ print("\n[5] 非成功判定：诊断行 + 硬挡重试")
 
 # 他的账号名/出口 IP/token 片段塞进正文，模拟真页面
 _LEAK_BODY = ("cl1631511 你好，今日签到已得 15 魔力。你的出口 IP 是 203.0.113.9，"
-              "session=abcdef0123456789abcdef0123456789")
+              "session=abcdef0123456789abcdef0123456789，请输入验证码")
 _diag = checkin._diag_page(FakePage(_LEAK_BODY, status=468, title="403 Forbidden",
                                     headers={"server": "safeline"}),
                            _Resp(468, {"server": "safeline"}))
 ok("cl1631511" not in _diag and "203.0.113.9" not in _diag,
    f"诊断行不含正文里的账号名和完整 IP（{(_diag or '')[:120]}）")
 ok("abcdef0123456789abcdef0123456789" not in _diag, "长 token 片段被抠掉")
+ok("你好" not in _diag and "今日签到已得 15 魔力" not in _diag,
+   "一个字都不抄，只报白名单词在不在场")
 ok("safeline" in _diag.lower(), "响应头 Server 进诊断行 —— 就是它告诉我们挡的是哪家 WAF")
 ok("403 Forbidden" in _diag, "页面标题进诊断行（标题只有站点自己的措辞）")
-ok("命中词=无" not in _diag and "forbidden" in _diag, "拦截词命中情况按白名单报出，不报原文")
+ok("拦截词=forbidden" in _diag, "拦截词按白名单报出")
+ok("线索词=验证码、输入、签到、魔力" in _diag,
+   f"线索词报出这一页是干什么的（{_diag}）")
 ok("正文=" in _diag and f"{len(_LEAK_BODY)}字符" in _diag, "只报正文长度")
 _empty_diag = checkin._diag_page(FakePage(""), _Resp(None))
-ok("Server=无" in _empty_diag and "命中词=无" in _empty_diag,
+ok("Server=无" in _empty_diag and "拦截词=无" in _empty_diag and "线索词=无" in _empty_diag,
    "读不到响应头/标记词时诊断行照样能出，不抛异常")
 
 
@@ -286,16 +290,36 @@ class SeqPage(FakePage):
         return _Resp(st, self.headers)
 
 
-_WARM = SeqPage([(468, ""), (200, "首页正文"), (200, REAL_SIGNED_PAGE)],
+_WARM = SeqPage([(468, _LEAK_BODY), (200, _LEAK_BODY), (200, REAL_SIGNED_PAGE)],
                 title="403 Forbidden")
 ok(checkin.do_checkin(_WARM, SITE_AUTO) is True,
    "第一次 468 → 回首页 → 再进签到页拿到真页 → OK（硬挡不再一口咬死）")
-ok(_WARM.goto_urls[1] == "https://piggo.me" and _WARM.goto_urls[2].endswith("/attendance.php"),
-   f"重试顺序是「首页 → 签到页」（{_WARM.goto_urls}）")
-_STILL = SeqPage([(468, ""), (200, "首页正文"), (468, "")], title="403 Forbidden")
+ok(len(_WARM.goto_urls) == 3 and _WARM.goto_urls[1] == "https://piggo.me"
+   and _WARM.goto_urls[2].endswith("/attendance.php"),
+   f"重试一共两次导航、顺序是「首页 → 签到页」（{_WARM.goto_urls}）")
+_STILL = SeqPage([(468, _LEAK_BODY), (200, _LEAK_BODY), (468, _LEAK_BODY)],
+                 title="403 Forbidden")
 ok(checkin.do_checkin(_STILL, SITE_AUTO) is False,
    "重试后仍然 468 → 照样 FAIL（多一次机会不等于多一次假绿）")
 ok(_STILL.submit_calls == 0, "被硬挡的两次都不对着挡架页点签到")
+# piggo 真出现过的形状：468 → warm-up 后签到页回 200，但页面上没有结果证据
+# 这一步必须继续往下走「真去提交一次」，不能因为第一次是 468 就一口咬死
+_w2 = SeqPage([(468, ""), (200, "首页正文"), (200, NOT_SIGNED_PAGE)],
+              has_form=True, after_submit=REAL_SIGNED_PAGE, title="猪猪 - Powered by NexusPHP")
+ok(checkin.do_checkin(_w2, SITE_AUTO) is True,
+   "468 → warm-up 拿到 200 的未签到页 → 照常提交并确认 → OK")
+ok(_w2.submit_calls == 1, f"warm-up 后真的提交过一次（submit_calls={_w2.submit_calls}）")
+# warm-up 提交后仍无证据 → 判据不能顶着早已过去的 468 说话
+_w3 = SeqPage([(468, ""), (200, "首页正文"), (200, NOT_SIGNED_PAGE)],
+              has_form=True, after_submit=NOT_SIGNED_PAGE, title="猪猪 - Powered by NexusPHP")
+import contextlib, io
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _w3_result = checkin.do_checkin(_w3, SITE_AUTO)
+_w3_lines = [l for l in _buf.getvalue().splitlines() if "提交后" in l]
+ok(_w3_result is False, "warm-up 后提交仍无回话 → FAIL")
+ok(_w3_lines and "468" not in _w3_lines[0],
+   f"重试后判读跟着新状态码走，不再顶着第一次的 468（{_w3_lines}）")
 
 print(f"\n{_passed}/{_passed + _failed} 通过")
 if _failed:

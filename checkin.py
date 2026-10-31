@@ -686,7 +686,10 @@ def await_page_text(page, tries: int = 4) -> str:
 
 # 分辨"是谁在挡"用的词：只报命中与否，绝不把原文打进日志
 _BLOCK_MARKERS = ["雷池", "safeline", "waf", "防火墙", "拦截", "blocked", "forbidden",
-                  "拒绝", "cloudflare", "just a moment", "captcha", "验证", "机器人"]
+                  "拒绝", "cloudflare", "just a moment", "captcha", "机器人"]
+# 这一页到底是干什么用的：签到表单？还是要先过站点自己那道验证？只看这些词在不在场。
+_CLUE_WORDS = ["安全码", "验证码", "滑块", "人机", "点击", "刷新", "输入", "签到", "补签",
+               "连续", "魔力", "排名", "登录", "登陆", "用户名", "密码", "已签到", "尚未", "错误"]
 
 
 def mask_personal(s: str) -> str:
@@ -696,11 +699,12 @@ def mask_personal(s: str) -> str:
 
 
 def _diag_page(page, resp) -> str:
-    """非成功判定时补一行信号：页面标题、响应头 Server、命中了哪些拦截词、正文长度。
+    """非成功判定时补一行信号：页面标题、响应头 Server、命中了哪些拦截词/线索词、正文长度。
 
-    判据只能告诉我们「这页不是签到结果」，告诉不了是谁挡的、为什么挡 —— 而下一步该改
-    Cookie 还是该换出口，取决于这个。这里只报站点/WAF 自己的措辞，不报正文：
-    NexusPHP 页面的正文里有账号名，库是公开的。
+    判据只能告诉我们「这页不是签到结果」，告诉不了是谁挡的、这一页是干什么的 —— 而下一步
+    该改 Cookie、该换出口，还是这站压根要人工过一道验证，取决于这个。所以只报站点自己的
+    措辞（标题、响应头、白名单词是否在场）和正文长度，绝不报正文：NexusPHP 页面的正文里有
+    账号名，库是公开的。
     """
     parts = []
     title = ""
@@ -723,16 +727,20 @@ def _diag_page(page, resp) -> str:
         body = ""
     low = (body + " " + title).lower()
     hits = [m for m in _BLOCK_MARKERS if m in low]
-    parts.append(f"命中词={'、'.join(hits) if hits else '无'}")
+    clues = [w for w in _CLUE_WORDS if w in low]
+    parts.append(f"拦截词={'、'.join(hits) if hits else '无'}")
+    parts.append(f"线索词={'、'.join(clues) if clues else '无'}")
     parts.append(f"正文={len(body)}字符")
     return " / ".join(parts)
 
 
-def _retry_after_home(page, site_config: dict, first_reason: str) -> bool:
+def _retry_after_home(page, site_config: dict) -> tuple[str, str, int]:
     """硬挡（4xx / 拦截页）时的最后一搏：先回首页让 WAF 认下这个会话，再进签到页。
 
     hdkyl、hitpt 直接进签到页是通的，piggo 回 468 —— 「首页通不通」和「签到页通不通」
     分开报出来，本身就能分辨是整站封出口还是只拦 attendance.php 这一条深链。
+    返回第二次的 (判定, 判据, 状态码)：状态码要交回调用方顶掉第一次那个 468，否则后面
+    每一步判读都顶着早已过去的错误码说话。
     """
     site_url = site_config["url"]
     checkin_url = f"{site_url}{site_config['checkin_path']}"
@@ -745,6 +753,7 @@ def _retry_after_home(page, site_config: dict, first_reason: str) -> bool:
         print(f"    [!] 首页没打开: {type(e).__name__}")
     time.sleep(5)
     att_status = 0
+    resp2 = None
     try:
         resp2 = page.goto(checkin_url, wait_until="domcontentloaded", timeout=60000)
         att_status = resp2.status if resp2 is not None else 0
@@ -754,11 +763,9 @@ def _retry_after_home(page, site_config: dict, first_reason: str) -> bool:
     verdict2, reason2 = classify_page(await_page_text(page), url_path_of(page),
                                       page.title(), att_status)
     print(f"    [DEBUG] 重试：首页 HTTP {home_status} / 签到页 HTTP {att_status} / 判定: {verdict2}")
-    if verdict2 == "success":
-        print(f"    [OK] 重试后确认已签到（{reason2}）")
-        return True
-    print(f"    [-] 签到未成功: {first_reason}；重试后 {reason2}")
-    return False
+    print(f"    [诊断] {_diag_page(page, resp2)}")
+    return verdict2, reason2, att_status
+
 
 
 def do_checkin(page, site_config: dict) -> bool:
@@ -858,7 +865,12 @@ def do_checkin(page, site_config: dict) -> bool:
         return True
     print(f"    [诊断] {_diag_page(page, resp)}")
     if verdict in ("blocked", "waf"):
-        return _retry_after_home(page, site_config, reason)
+        # 硬挡过一次不代表这站不给签：回首页 warm-up 后再看一眼拿到的是什么页。
+        # 仍是 blocked/waf 就顺着下面的 verdict != unknown 报红；unknown 则往下真提交一次。
+        verdict, reason, http_status = _retry_after_home(page, site_config)
+        if verdict == "success":
+            print(f"    [OK] 重试后确认已签到（{reason}）")
+            return True
     if verdict != "unknown":
         print(f"    [-] 签到未成功: {reason}")
         return False
