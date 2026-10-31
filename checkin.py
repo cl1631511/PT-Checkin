@@ -221,15 +221,19 @@ def build_cloak_proxy_config(proxy_url: str) -> dict | str | None:
     return proxy_config
 
 
+# SOCKS5 连通性探测地址（用法见 _test_socks5_proxy 里的注释）
+SOCKS_PROBE_URL = "https://api.ipify.org"
+
+
 def test_proxy(proxy_url: str, timeout: int = 10, retries: int = 3) -> tuple[bool, str]:
     """
     测试代理是否可用。
-    
+
     Args:
         proxy_url: 代理 URL
         timeout: 超时时间（秒）
         retries: 重试次数
-    
+
     Returns:
         (是否可用, 测试结果描述)
     """
@@ -283,17 +287,20 @@ def _test_socks5_proxy(parsed, timeout: int, retries: int) -> tuple[bool, str]:
             try:
                 # 测试连接
                 import urllib.request
-                
-                # 创建请求
+
+                # 探测地址必须只有 A 记录：PySocks 不认 IPv6，www.cloudflare.com
+                # 有 AAAA，urlopen 选中它就抛 "PySocks doesn't support IPv6"，
+                # 代理明明能用却被判失败、整轮签到退成直连。
                 req = urllib.request.Request(
-                    "https://www.cloudflare.com",
+                    SOCKS_PROBE_URL,
                     headers={"User-Agent": "Mozilla/5.0"}
                 )
-                
+
                 # 发送请求（使用代理）
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     status = resp.getcode()
                     if 200 <= status < 400:
+                        # 正文是出口 IP 本身，public 日志里不能出现，只报状态码
                         return True, f"测试成功 (状态码: {status})"
                     else:
                         return False, f"状态码异常: {status}"
@@ -646,6 +653,9 @@ def classify_page(page_text: str, url_path: str = "", title: str = "", http_stat
         return "login", f"HTTP {http_status}，登录态已失效"
     if http_status in (403, 429, 503):
         return "blocked", f"HTTP {http_status}，被拦截"
+    if http_status >= 400:
+        # piggo 那天回的是 468（WAF 自定义码），不在标准名单里也一样是挡架
+        return "blocked", f"HTTP {http_status}，站点没给出签到页"
     if "雷池" in t:
         return "waf", "仍停在雷池WAF验证页"
     if "just a moment" in low or "attention required" in low or "have been blocked" in low:

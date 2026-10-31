@@ -120,6 +120,7 @@ class FakePage:
         self.status = status
         self.title_text = title
         self.goto_urls = []
+        self.submit_calls = 0
 
     def goto(self, url, **kw):
         self.goto_urls.append(url)
@@ -133,12 +134,14 @@ class FakePage:
 
     def evaluate(self, script):
         if "getElementById('attendance')" in script:
+            self.submit_calls += 1
             if not self.has_form:
                 return False
             if self.after_submit is not None:
                 self.text = self.after_submit
             return True
         if "querySelectorAll('a')" in script:
+            self.submit_calls += 1
             if not self.has_link:
                 return False
             if self.after_submit is not None:
@@ -181,6 +184,14 @@ ok(checkin.do_checkin(FakePage("", status=403), SITE_AUTO) is False,
 # 状态码 200 但正文是登录表单：Cookie 失效
 ok(checkin.do_checkin(FakePage(LOGIN_PAGE), SITE_AUTO) is False,
    "HTTP 200 + 登录表单正文 → FAIL")
+# 真事故 #2：piggo 那次回的是 HTTP 468 + 651 字符的挡架页，标准 4xx 名单里没有它
+ok(checkin.classify_page(NOT_SIGNED_PAGE * 20, "/attendance.php", "", 468)[0] == "blocked",
+   "HTTP 468（WAF 自定义码）→ blocked")
+_p468 = FakePage(NOT_SIGNED_PAGE * 20, status=468, has_form=True)
+ok(checkin.do_checkin(_p468, SITE_AUTO) is False,
+   "HTTP 468 + auto → FAIL")
+ok(_p468.submit_calls == 0,
+   "HTTP 468 直接定性，不再对着挡架页乱点签到")
 # turnstile 站点没有「签到成功」证据时，仍走原来的 turnstile 分支（不回归）
 _seen = []
 _orig_ts = checkin._checkin_turnstile
@@ -196,6 +207,44 @@ _src = (ROOT / "checkin.py").read_text(encoding="utf-8")
 ok("if fail_count > 0:" in _src and _src.index("if fail_count > 0:") >
    _src.index("send_bark_notification(title, body, is_critical)"),
    "有站点失败时 main() 以非 0 退出（Actions 不再全绿）")
+
+# ===================== 4. SOCKS5 探测不能用带 AAAA 的地址 =====================
+print("\n[4] SOCKS5 代理探测")
+import urllib.parse
+import urllib.request as _ur
+
+
+class _FakeResp:
+    def getcode(self):
+        return 200
+
+    def read(self):
+        return b"203.0.113.9"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_probe = {"urls": []}
+_ur.urlopen = lambda req, timeout=None: (_probe["urls"].append(req.full_url), _FakeResp())[1]
+socks_stub = types.ModuleType("socks")
+socks_stub.SOCKS5 = 5
+socks_stub.socksocket = type("_SocksSock", (), {})
+socks_stub.set_default_proxy = lambda *a, **k: None
+sys.modules["socks"] = socks_stub
+
+res, msg = checkin._test_socks5_proxy(
+    urllib.parse.urlparse("socks5://u:p@proxy.example:1080"), timeout=5, retries=1)
+ok(res is True, "SOCKS5 探测通 → True（过去这里假失败，整轮退成直连）")
+ok(_probe["urls"] and urllib.parse.urlparse(_probe["urls"][0]).hostname in
+   ("api.ipify.org", "ipv4.icanhazip.com"),
+   "探测地址是点名验证过「只有 A 记录」的服务")
+ok(_probe["urls"] and "cloudflare.com" not in _probe["urls"][0],
+   "不再探测带 AAAA 的 www.cloudflare.com（PySocks 不支持 IPv6 会假失败）")
+ok("203.0.113.9" not in msg, "探测正文（出口 IP）不进日志")
 
 print(f"\n{_passed}/{_passed + _failed} 通过")
 if _failed:
