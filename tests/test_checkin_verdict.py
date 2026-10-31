@@ -112,7 +112,7 @@ class FakePage:
     """按 JS 片段分派返回值的最小 Playwright 页面对象。"""
 
     def __init__(self, text, *, has_form=False, has_link=False, after_submit=None,
-                 path="/attendance.php", status=200, title="", headers=None):
+                 path="/attendance.php", status=200, title="", headers=None, shape=None):
         self.text = text
         self.has_form = has_form
         self.has_link = has_link
@@ -121,6 +121,7 @@ class FakePage:
         self.status = status
         self.title_text = title
         self.headers = headers or {}
+        self.shape = shape
         self.goto_urls = []
         self.submit_calls = 0
 
@@ -135,6 +136,10 @@ class FakePage:
         return self.title_text
 
     def evaluate(self, script):
+        if "login_links" in script:      # _PAGE_SHAPE_JS：只数个数，不抄内容
+            return self.shape if self.shape is not None else {
+                "forms": 0, "inputs": 0, "links": 0, "imgs": 0, "att_form": 0,
+                "login_links": 0, "member_links": 0, "captcha": 0, "pass_inputs": 0}
         if "getElementById('attendance')" in script:
             self.submit_calls += 1
             if not self.has_form:
@@ -268,6 +273,19 @@ ok("拦截词=forbidden" in _diag, "拦截词按白名单报出")
 ok("线索词=验证码、输入、签到、魔力" in _diag,
    f"线索词报出这一页是干什么的（{_diag}）")
 ok("正文=" in _diag and f"{len(_LEAK_BODY)}字符" in _diag, "只报正文长度")
+ok("页面形状=表单0/输入0/链接0/签到表单0/登录链接0/会员链接0" in _diag,
+   f"页面骨架的计数进诊断行（{_diag}）")
+# piggo 这两轮真实遇到的形状：有 layout、有「登录」入口、没有签到表单、没有会员链接
+_LOGGED_OUT = {"forms": 1, "inputs": 0, "links": 40, "imgs": 3, "att_form": 0,
+               "login_links": 1, "member_links": 0, "captcha": 0, "pass_inputs": 0}
+_d2 = checkin._diag_page(FakePage(_LEAK_BODY, status=200, title="猪猪 - Powered by NexusPHP",
+                                  shape=_LOGGED_OUT), _Resp(200, {"server": "cloudflare"}))
+ok("登录链接1/会员链接0" in _d2 and "签到表单0" in _d2,
+   f"「按登录态看是游客页」这个形状能直接从日志读出来（{_d2}）")
+ok("cl1631511" not in _d2, "带形状计数照样不抄正文")
+_d3 = checkin._diag_page(FakePage(_LEAK_BODY, shape=dict(_LOGGED_OUT, captcha=1,
+                                                         pass_inputs=1)), _Resp(200))
+ok("验证码框=1 密码框=1" in _d3, "有验证码框/密码框时单独点名（决定要不要走人工）")
 _empty_diag = checkin._diag_page(FakePage(""), _Resp(None))
 ok("Server=无" in _empty_diag and "拦截词=无" in _empty_diag and "线索词=无" in _empty_diag,
    "读不到响应头/标记词时诊断行照样能出，不抛异常")

@@ -689,7 +689,24 @@ _BLOCK_MARKERS = ["雷池", "safeline", "waf", "防火墙", "拦截", "blocked",
                   "拒绝", "cloudflare", "just a moment", "captcha", "机器人"]
 # 这一页到底是干什么用的：签到表单？还是要先过站点自己那道验证？只看这些词在不在场。
 _CLUE_WORDS = ["安全码", "验证码", "滑块", "人机", "点击", "刷新", "输入", "签到", "补签",
-               "连续", "魔力", "排名", "登录", "登陆", "用户名", "密码", "已签到", "尚未", "错误"]
+               "连续", "魔力", "排名", "登录", "登陆", "用户名", "密码", "已签到", "尚未", "错误",
+               "出错", "抱歉", "无法", "暂时", "关闭", "退出", "注册", "重新登录", "权限", "维护"]
+
+# 页面的骨架：数个数、不抄内容。判据只能说「这页没签到证据」，这些数能说出为什么。
+_PAGE_SHAPE_JS = """() => {
+    const q = (s) => document.querySelectorAll(s).length;
+    const href = (frag) => Array.from(document.querySelectorAll('a'))
+        .filter(a => (a.href || '').indexOf(frag) >= 0).length;
+    return {
+        forms: q('form'), inputs: q('input'), links: q('a'), imgs: q('img'),
+        att_form: q('#attendance') + q('form[action*="attendance"]'),
+        login_links: href('login.php'),
+        member_links: href('logout') + href('userdetails'),
+        captcha: q('input[name*="code"]') + q('input[id*="code"]')
+                 + q('img[src*="imagecode"]') + q('img[src*="captcha"]'),
+        pass_inputs: q('input[type="password"]')
+    };
+}"""
 
 
 def mask_personal(s: str) -> str:
@@ -699,11 +716,11 @@ def mask_personal(s: str) -> str:
 
 
 def _diag_page(page, resp) -> str:
-    """非成功判定时补一行信号：页面标题、响应头 Server、命中了哪些拦截词/线索词、正文长度。
+    """非成功判定时补一行信号：标题、响应头 Server、拦截词/线索词、正文长度、页面骨架计数。
 
     判据只能告诉我们「这页不是签到结果」，告诉不了是谁挡的、这一页是干什么的 —— 而下一步
     该改 Cookie、该换出口，还是这站压根要人工过一道验证，取决于这个。所以只报站点自己的
-    措辞（标题、响应头、白名单词是否在场）和正文长度，绝不报正文：NexusPHP 页面的正文里有
+    措辞（标题、响应头、白名单词是否在场）和元素个数，绝不报正文：NexusPHP 页面的正文里有
     账号名，库是公开的。
     """
     parts = []
@@ -731,6 +748,17 @@ def _diag_page(page, resp) -> str:
     parts.append(f"拦截词={'、'.join(hits) if hits else '无'}")
     parts.append(f"线索词={'、'.join(clues) if clues else '无'}")
     parts.append(f"正文={len(body)}字符")
+    try:
+        sh = page.evaluate(_PAGE_SHAPE_JS) or {}
+    except Exception:
+        sh = {}
+    if isinstance(sh, dict) and sh:
+        parts.append("页面形状=表单{}/输入{}/链接{}/签到表单{}/登录链接{}/会员链接{}".format(
+            sh.get("forms", "?"), sh.get("inputs", "?"), sh.get("links", "?"),
+            sh.get("att_form", "?"), sh.get("login_links", "?"),
+            sh.get("member_links", "?")))
+        if sh.get("captcha") or sh.get("pass_inputs"):
+            parts.append(f"验证码框={sh.get('captcha', 0)} 密码框={sh.get('pass_inputs', 0)}")
     return " / ".join(parts)
 
 
