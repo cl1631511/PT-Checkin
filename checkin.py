@@ -189,14 +189,11 @@ def build_cloak_proxy_config(proxy_url: str) -> dict | str | None:
     if not proxy_url:
         return None
     
-    from urllib.parse import urlparse
+    parsed = urllib.parse.urlparse(proxy_url)
     
-    parsed = urlparse(proxy_url)
-    
-    # 支持的代理协议
-    schemes = ['http', 'https', 'socks5', 'socks5h']
-    if parsed.scheme not in schemes:
-        print(f"    [!] 不支持的代理协议: {parsed.scheme}，支持: {schemes}")
+    # 支持的代理协议（和 test_proxy 同一份，别各写一遍）
+    if parsed.scheme not in PROXY_SCHEMES:
+        print(f"    [!] 不支持的代理协议: {parsed.scheme}，支持: {PROXY_SCHEMES}")
         return None
     
     if not parsed.hostname or not parsed.port:
@@ -221,135 +218,174 @@ def build_cloak_proxy_config(proxy_url: str) -> dict | str | None:
     return proxy_config
 
 
-# SOCKS5 连通性探测地址（用法见 _test_socks5_proxy 里的注释）
-SOCKS_PROBE_URL = "https://api.ipify.org"
+# 探测站点必须满足两条：① 只有 A 记录（PySocks 不认 IPv6，urllib 挑中 AAAA 就抛
+# "PySocks doesn't support IPv6"，代理明明能用却被判失败）；② 不嫌弃云机房出口 IP。
+# api.ipify.org 看着两条都行，实际第②条不过 —— 它会把机房出口的 TLS 直接重置
+# （本机 curl 也复现出同一个 "Connection was reset"），2026-10-31 因此连坏四轮，
+# 把「探针插不通」报成「代理服务端坏了」。checkip.amazonaws.com 两条都过。
+SOCKS_PROBE_URL = "https://checkip.amazonaws.com"
+
+# HTTP 代理那条走 requests，不受 PySocks 的 IPv6 限制，所以老地址照用
+HTTP_PROBE_URL = "https://www.cloudflare.com"
+
+# 代理协议白名单：build_cloak_proxy_config 和 test_proxy 共用一份，别各写一遍
+PROXY_SCHEMES = ["http", "https", "socks5", "socks5h"]
 
 
-def test_proxy(proxy_url: str, timeout: int = 10, retries: int = 3) -> tuple[bool, str]:
+def _hide(msg, proxy_url: str = "") -> str:
+    """代理的报错要进公开日志，里面常混着主机名和账号密码 —— 按代理 URL 自己遮。"""
+    out = mask_personal(str(msg or ""))
+    if proxy_url:
+        parsed = urllib.parse.urlparse(proxy_url)
+        out = out.replace(proxy_url, mask_proxy_url(proxy_url))
+        if parsed.password:
+            out = out.replace(parsed.password, "***")
+        if parsed.username:
+            out = out.replace(parsed.username, "***")
+        if parsed.hostname:
+            host = parsed.hostname
+            out = out.replace(host, f"***.{host.split('.')[-1]}" if "." in host else "***")
+    return out
+
+
+def _recv_exact(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("对端在握手中途断开")
+        buf += chunk
+    return buf
+
+
+def socks5_handshake(host, port, username=None, password=None, timeout: int = 10):
+    """只跟代理服务器把 SOCKS5 招呼打完，不碰任何第三方站点。
+
+    以前只有一句 SSL 错，把「连不上你的服务器」「账密不对」「服务器活着但出口到不了外面」
+    压成同一条；这三层的修法完全不同，所以先单独问第一层。
     """
-    测试代理是否可用。
+    try:
+        s = socket.create_connection((host, int(port)), timeout=timeout)
+    except OSError as e:
+        return False, f"连不上代理服务器（{e.__class__.__name__}: {e}）"
+    s.settimeout(timeout)
+    try:
+        user = username.encode() if username else None
+        pwd = password.encode() if password else None
+        s.sendall(bytes([5, 2, 0, 2]) if (user and pwd) else bytes([5, 1, 0]))
+        chosen = _recv_exact(s, 2)
+        if chosen[0] != 5:
+            return False, (f"对端首字节是 {chosen[0]}、不是 SOCKS5 —— 这个端口多半是 HTTP 代理，"
+                           f"PROXY_URL 要写成 http://")
+        if chosen[1] == 0:
+            return True, "SOCKS5 握手成功"
+        if chosen[1] == 2:
+            if not (user and pwd):
+                return False, ("代理服务器要求账号密码，URL 里没带 "
+                               "（写成 socks5://用户:密码@主机:端口）")
+            s.sendall(bytes([1, len(user)]) + user + bytes([len(pwd)]) + pwd)
+            st = _recv_exact(s, 2)
+            if st[1] == 0:
+                return True, "SOCKS5 握手成功（账号密码已通过）"
+            return False, "账号密码被代理服务器拒绝"
+        return False, f"服务端选了不支持的认证方法 {chosen[1]}"
+    except OSError as e:
+        return False, f"握手时断开（{e.__class__.__name__}: {e}）"
+    finally:
+        s.close()
 
-    Args:
-        proxy_url: 代理 URL
-        timeout: 超时时间（秒）
-        retries: 重试次数
 
-    Returns:
-        (是否可用, 测试结果描述)
-    """
-    if not proxy_url:
-        return False, "代理 URL 为空"
-    
-    from urllib.parse import urlparse
-    
-    parsed = urlparse(proxy_url)
-    if not parsed.hostname or not parsed.port:
-        return False, "代理 URL 格式无效"
-    
-    # 测试目标：使用一个稳定的网站
-    test_url = "https://www.cloudflare.com"
-    
-    # 根据协议选择测试方法
-    if parsed.scheme.startswith('socks5'):
-        return _test_socks5_proxy(parsed, timeout, retries)
-    elif parsed.scheme in ['http', 'https']:
-        return _test_http_proxy(proxy_url, test_url, timeout, retries)
-    else:
-        return False, f"不支持的代理协议: {parsed.scheme}"
-
-
-def _test_socks5_proxy(parsed, timeout: int, retries: int) -> tuple[bool, str]:
-    """测试 SOCKS5 代理是否可用"""
+def _socks_probe(parsed, timeout: int, retries: int):
+    """隔着代理够一下探测站点 —— 问的是「出口到不到得了外面」，不是「代理活着没」。"""
     import socks
-    
+
     for attempt in range(retries):
         try:
-            # 设置 SOCKS5 代理
             if parsed.username and parsed.password:
-                socks.set_default_proxy(
-                    socks.SOCKS5,
-                    parsed.hostname,
-                    parsed.port,
-                    username=parsed.username,
-                    password=parsed.password
-                )
+                socks.set_default_proxy(socks.SOCKS5, parsed.hostname, parsed.port,
+                                        username=parsed.username.encode(),
+                                        password=parsed.password.encode())
             else:
-                socks.set_default_proxy(
-                    socks.SOCKS5,
-                    parsed.hostname,
-                    parsed.port
-                )
-            
-            # 替换 socket 创建
+                socks.set_default_proxy(socks.SOCKS5, parsed.hostname, parsed.port)
             original_socket = socket.socket
             socket.socket = socks.socksocket
-            
             try:
-                # 测试连接
                 import urllib.request
-
-                # 探测地址必须只有 A 记录：PySocks 不认 IPv6，www.cloudflare.com
-                # 有 AAAA，urlopen 选中它就抛 "PySocks doesn't support IPv6"，
-                # 代理明明能用却被判失败、整轮签到退成直连。
-                req = urllib.request.Request(
-                    SOCKS_PROBE_URL,
-                    headers={"User-Agent": "Mozilla/5.0"}
-                )
-
-                # 发送请求（使用代理）
+                req = urllib.request.Request(SOCKS_PROBE_URL,
+                                             headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     status = resp.getcode()
                     if 200 <= status < 400:
-                        # 正文是出口 IP 本身，public 日志里不能出现，只报状态码
-                        return True, f"测试成功 (状态码: {status})"
-                    else:
-                        return False, f"状态码异常: {status}"
-                        
-            except urllib.error.URLError as e:
-                error_msg = str(e)
-                if attempt < retries - 1:
-                    print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
-                    time.sleep(2)
-                    continue
-                else:
-                    return False, f"连接失败: {error_msg}"
-            except socket.error as e:
-                error_msg = str(e)
-                if attempt < retries - 1:
-                    print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
-                    time.sleep(2)
-                    continue
-                else:
-                    return False, f"socket 错误: {error_msg}"
-            except Exception as e:
-                error_msg = str(e)
-                if attempt < retries - 1:
-                    print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
-                    time.sleep(2)
-                    continue
-                else:
-                    return False, f"未知错误: {error_msg}"
+                        # 正文就是出口 IP 本身，公开日志里不能出现，只报状态码
+                        return True, f"状态码 {status}"
+                    return False, f"状态码异常: {status}"
             finally:
-                # 恢复原始 socket
                 socket.socket = original_socket
-                
         except ImportError:
-            return False, "socks 模块未安装，请安装: pip install PySocks"
+            return False, "sock 模块未安装，请安装: pip install PySocks"
         except Exception as e:
+            error_msg = _hide(str(e))
             if attempt < retries - 1:
-                print(f"    [*] SOCKS5 代理测试失败 ({attempt + 1}/{retries}): {e}，重试...")
+                print(f"    [*] 探测站点没回话，重试 ({attempt + 1}/{retries}): {error_msg}")
                 time.sleep(2)
                 continue
-            else:
-                return False, f"测试异常: {e}"
-    
+            return False, error_msg
     return False, f"重试 {retries} 次后仍然失败"
 
 
-def _test_http_proxy(proxy_url: str, test_url: str, timeout: int, retries: int) -> tuple[bool, str]:
-    """测试 HTTP/HTTPS 代理是否可用"""
+def _tcp_open(host, port, timeout: int = 10) -> bool:
+    try:
+        s = socket.create_connection((host, int(port)), timeout=timeout)
+    except OSError:
+        return False
+    s.close()
+    return True
+
+
+def test_proxy(proxy_url: str, timeout: int = 10, retries: int = 3):
+    """分两层问：① 代理服务器本身通不通、账密对不对；② 它的出口够不够得着探测站点。
+
+    第一个返回值是「这一轮要不要用代理」，所以只有第①层失败才否决。第②层失败只是
+    探测站点自己的态度（它可能就是不欢迎机房出口 IP），照用代理，话留在日志里。
+    """
+    if not proxy_url:
+        return False, "代理 URL 为空"
+
+    parsed = urllib.parse.urlparse(proxy_url)
+    if parsed.scheme not in PROXY_SCHEMES:
+        return False, _hide(
+            f"不支持的代理协议: {parsed.scheme or '（没写协议名）'}；支持 "
+            + "、".join(f"{s}://" for s in PROXY_SCHEMES), proxy_url)
+    if not parsed.hostname or not parsed.port:
+        return False, _hide(
+            "代理 URL 格式无效：必须是 协议://[账号:密码@]主机:端口，端口不能省", proxy_url)
+
+    if parsed.scheme.startswith("socks5"):
+        hand_ok, hand_msg = socks5_handshake(parsed.hostname, parsed.port,
+                                             parsed.username or None,
+                                             parsed.password or None, timeout)
+        if not hand_ok:
+            return False, _hide(f"和代理服务器握手失败: {hand_msg}", proxy_url)
+        probe_ok, probe_msg = _socks_probe(parsed, timeout, retries)
+        if probe_ok:
+            return True, _hide(f"SOCKS5 握手成功，出口可达（{probe_msg}）", proxy_url)
+        return True, _hide(
+            f"SOCKS5 握手成功，但探测站点没回话: {probe_msg} —— 那是探测站点的态度，"
+            f"不代表代理坏了，这一轮照样用代理签到", proxy_url)
+
+    if not _tcp_open(parsed.hostname, parsed.port, timeout):
+        return False, _hide("连不上代理服务器（TCP 端口不通）", proxy_url)
+    probe_ok, probe_msg = _http_probe(proxy_url, timeout, retries)
+    if probe_ok:
+        return True, _hide(f"TCP 可达，出口可达（{probe_msg}）", proxy_url)
+    return True, _hide(f"TCP 可达，但探测站点没回话: {probe_msg} —— 这一轮照样用代理签到",
+                       proxy_url)
+
+
+def _http_probe(proxy_url: str, timeout: int, retries: int) -> tuple[bool, str]:
+    """隔着 HTTP 代理够一下探测站点（IPv6 由 requests 处理，不受 PySocks 那个限制）"""
     import requests
-    
+
     proxies = {
         'http': proxy_url,
         'https': proxy_url,
@@ -357,25 +393,25 @@ def _test_http_proxy(proxy_url: str, test_url: str, timeout: int, retries: int) 
     
     for attempt in range(retries):
         try:
-            response = requests.get(test_url, proxies=proxies, timeout=timeout, headers={
+            response = requests.get(HTTP_PROBE_URL, proxies=proxies, timeout=timeout, headers={
                 "User-Agent": "Mozilla/5.0"
             })
             status = response.status_code
             if 200 <= status < 400:
-                return True, f"测试成功 (状态码: {status})"
+                return True, f"状态码 {status}"
             else:
                 return False, f"状态码异常: {status}"
         except requests.exceptions.RequestException as e:
             error_msg = str(e)
             if attempt < retries - 1:
-                print(f"    [*] HTTP 代理测试失败 ({attempt + 1}/{retries}): {error_msg}，重试...")
+                print(f"    [*] 探测站点没回话，重试 ({attempt + 1}/{retries}): {error_msg}，重试...")
                 time.sleep(2)
                 continue
             else:
                 return False, f"请求异常: {error_msg}"
         except Exception as e:
             if attempt < retries - 1:
-                print(f"    [*] HTTP 代理测试失败 ({attempt + 1}/{retries}): {e}，重试...")
+                print(f"    [*] 探测站点没回话，重试 ({attempt + 1}/{retries}): {e}，重试...")
                 time.sleep(2)
                 continue
             else:
@@ -1240,12 +1276,12 @@ def main():
             use_proxy = True
             proxy_config = build_cloak_proxy_config(proxy_url)
             if proxy_config:
-                print(f"    [✓] 代理测试通过: {proxy_test_result[1]}")
+                print(f"    [✓] 代理可用: {proxy_test_result[1]}")
             else:
                 print(f"    [✗] 代理解析失败，使用直连")
                 use_proxy = False
         else:
-            print(f"    [✗] 代理测试失败: {proxy_test_result[1]}")
+            print(f"    [✗] 代理不可用: {proxy_test_result[1]}")
             print(f"    [*] 将使用直连（不使用代理）进行签到")
     else:
         print("    [*] 未配置代理，使用直连")

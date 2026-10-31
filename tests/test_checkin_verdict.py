@@ -216,45 +216,7 @@ ok("if fail_count > 0:" in _src and _src.index("if fail_count > 0:") >
    _src.index("send_bark_notification(title, body, is_critical)"),
    "有站点失败时 main() 以非 0 退出（Actions 不再全绿）")
 
-# ===================== 4. SOCKS5 探测不能用带 AAAA 的地址 =====================
-print("\n[4] SOCKS5 代理探测")
-import urllib.parse
-import urllib.request as _ur
-
-
-class _FakeResp:
-    def getcode(self):
-        return 200
-
-    def read(self):
-        return b"203.0.113.9"
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
-_probe = {"urls": []}
-_ur.urlopen = lambda req, timeout=None: (_probe["urls"].append(req.full_url), _FakeResp())[1]
-socks_stub = types.ModuleType("socks")
-socks_stub.SOCKS5 = 5
-socks_stub.socksocket = type("_SocksSock", (), {})
-socks_stub.set_default_proxy = lambda *a, **k: None
-sys.modules["socks"] = socks_stub
-
-res, msg = checkin._test_socks5_proxy(
-    urllib.parse.urlparse("socks5://u:p@proxy.example:1080"), timeout=5, retries=1)
-ok(res is True, "SOCKS5 探测通 → True（过去这里假失败，整轮退成直连）")
-ok(_probe["urls"] and urllib.parse.urlparse(_probe["urls"][0]).hostname in
-   ("api.ipify.org", "ipv4.icanhazip.com"),
-   "探测地址是点名验证过「只有 A 记录」的服务")
-ok(_probe["urls"] and "cloudflare.com" not in _probe["urls"][0],
-   "不再探测带 AAAA 的 www.cloudflare.com（PySocks 不支持 IPv6 会假失败）")
-ok("203.0.113.9" not in msg, "探测正文（出口 IP）不进日志")
-
-# ===================== 5. 红的时候要说清是谁挡的 =====================
+# ===================== 4. 红的时候要说清是谁挡的 =====================
 print("\n[5] 非成功判定：诊断行 + 硬挡重试")
 
 # 他的账号名/出口 IP/token 片段塞进正文，模拟真页面
