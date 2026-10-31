@@ -103,15 +103,16 @@ print("\n[2] do_checkin 自动签到模式")
 
 
 class _Resp:
-    def __init__(self, status):
+    def __init__(self, status, headers=None):
         self.status = status
+        self.headers = headers or {}
 
 
 class FakePage:
     """按 JS 片段分派返回值的最小 Playwright 页面对象。"""
 
     def __init__(self, text, *, has_form=False, has_link=False, after_submit=None,
-                 path="/attendance.php", status=200, title=""):
+                 path="/attendance.php", status=200, title="", headers=None):
         self.text = text
         self.has_form = has_form
         self.has_link = has_link
@@ -119,12 +120,13 @@ class FakePage:
         self.url = "https://piggo.me" + path
         self.status = status
         self.title_text = title
+        self.headers = headers or {}
         self.goto_urls = []
         self.submit_calls = 0
 
     def goto(self, url, **kw):
         self.goto_urls.append(url)
-        return _Resp(self.status)
+        return _Resp(self.status, self.headers)
 
     def wait_for_load_state(self, **kw):
         pass
@@ -245,6 +247,55 @@ ok(_probe["urls"] and urllib.parse.urlparse(_probe["urls"][0]).hostname in
 ok(_probe["urls"] and "cloudflare.com" not in _probe["urls"][0],
    "不再探测带 AAAA 的 www.cloudflare.com（PySocks 不支持 IPv6 会假失败）")
 ok("203.0.113.9" not in msg, "探测正文（出口 IP）不进日志")
+
+# ===================== 5. 红的时候要说清是谁挡的 =====================
+print("\n[5] 非成功判定：诊断行 + 硬挡重试")
+
+# 他的账号名/出口 IP/token 片段塞进正文，模拟真页面
+_LEAK_BODY = ("cl1631511 你好，今日签到已得 15 魔力。你的出口 IP 是 203.0.113.9，"
+              "session=abcdef0123456789abcdef0123456789")
+_diag = checkin._diag_page(FakePage(_LEAK_BODY, status=468, title="403 Forbidden",
+                                    headers={"server": "safeline"}),
+                           _Resp(468, {"server": "safeline"}))
+ok("cl1631511" not in _diag and "203.0.113.9" not in _diag,
+   f"诊断行不含正文里的账号名和完整 IP（{(_diag or '')[:120]}）")
+ok("abcdef0123456789abcdef0123456789" not in _diag, "长 token 片段被抠掉")
+ok("safeline" in _diag.lower(), "响应头 Server 进诊断行 —— 就是它告诉我们挡的是哪家 WAF")
+ok("403 Forbidden" in _diag, "页面标题进诊断行（标题只有站点自己的措辞）")
+ok("命中词=无" not in _diag and "forbidden" in _diag, "拦截词命中情况按白名单报出，不报原文")
+ok("正文=" in _diag and f"{len(_LEAK_BODY)}字符" in _diag, "只报正文长度")
+_empty_diag = checkin._diag_page(FakePage(""), _Resp(None))
+ok("Server=无" in _empty_diag and "命中词=无" in _empty_diag,
+   "读不到响应头/标记词时诊断行照样能出，不抛异常")
+
+
+class SeqPage(FakePage):
+    """按导航顺序改状态码和正文：真站点被 WAF 挡时，回首页再进签到页是通的另一半。"""
+
+    def __init__(self, steps, **kw):
+        super().__init__(steps[0][1], **kw)
+        self.steps = steps
+        self.n = 0
+
+    def goto(self, url, **kw):
+        st, text = self.steps[min(self.n, len(self.steps) - 1)]
+        self.n += 1
+        self.status, self.text = st, text
+        self.url = url
+        self.goto_urls.append(url)
+        return _Resp(st, self.headers)
+
+
+_WARM = SeqPage([(468, ""), (200, "首页正文"), (200, REAL_SIGNED_PAGE)],
+                title="403 Forbidden")
+ok(checkin.do_checkin(_WARM, SITE_AUTO) is True,
+   "第一次 468 → 回首页 → 再进签到页拿到真页 → OK（硬挡不再一口咬死）")
+ok(_WARM.goto_urls[1] == "https://piggo.me" and _WARM.goto_urls[2].endswith("/attendance.php"),
+   f"重试顺序是「首页 → 签到页」（{_WARM.goto_urls}）")
+_STILL = SeqPage([(468, ""), (200, "首页正文"), (468, "")], title="403 Forbidden")
+ok(checkin.do_checkin(_STILL, SITE_AUTO) is False,
+   "重试后仍然 468 → 照样 FAIL（多一次机会不等于多一次假绿）")
+ok(_STILL.submit_calls == 0, "被硬挡的两次都不对着挡架页点签到")
 
 print(f"\n{_passed}/{_passed + _failed} 通过")
 if _failed:

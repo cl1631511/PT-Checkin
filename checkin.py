@@ -684,6 +684,83 @@ def await_page_text(page, tries: int = 4) -> str:
     return ""
 
 
+# 分辨"是谁在挡"用的词：只报命中与否，绝不把原文打进日志
+_BLOCK_MARKERS = ["雷池", "safeline", "waf", "防火墙", "拦截", "blocked", "forbidden",
+                  "拒绝", "cloudflare", "just a moment", "captcha", "验证", "机器人"]
+
+
+def mask_personal(s: str) -> str:
+    """把可能落在公开日志里的东西抠掉：完整 IPv4、长数字/十六进制串（uid、token 片段）。"""
+    s = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", "*.*.*.*", str(s or ""))
+    return re.sub(r"[0-9a-f]{16,}", "***", s)
+
+
+def _diag_page(page, resp) -> str:
+    """非成功判定时补一行信号：页面标题、响应头 Server、命中了哪些拦截词、正文长度。
+
+    判据只能告诉我们「这页不是签到结果」，告诉不了是谁挡的、为什么挡 —— 而下一步该改
+    Cookie 还是该换出口，取决于这个。这里只报站点/WAF 自己的措辞，不报正文：
+    NexusPHP 页面的正文里有账号名，库是公开的。
+    """
+    parts = []
+    title = ""
+    try:
+        title = (page.title() or "").strip().replace("\n", " ")
+    except Exception:
+        title = ""
+    parts.append(f"标题={mask_personal(title[:60]) if title else '空'}")
+    server = ""
+    try:
+        headers = resp.headers if resp is not None else None
+        if headers:
+            server = headers.get("server") or headers.get("Server") or ""
+    except Exception:
+        server = ""
+    parts.append(f"Server={mask_personal(server[:40]) if server else '无'}")
+    try:
+        body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+    except Exception:
+        body = ""
+    low = (body + " " + title).lower()
+    hits = [m for m in _BLOCK_MARKERS if m in low]
+    parts.append(f"命中词={'、'.join(hits) if hits else '无'}")
+    parts.append(f"正文={len(body)}字符")
+    return " / ".join(parts)
+
+
+def _retry_after_home(page, site_config: dict, first_reason: str) -> bool:
+    """硬挡（4xx / 拦截页）时的最后一搏：先回首页让 WAF 认下这个会话，再进签到页。
+
+    hdkyl、hitpt 直接进签到页是通的，piggo 回 468 —— 「首页通不通」和「签到页通不通」
+    分开报出来，本身就能分辨是整站封出口还是只拦 attendance.php 这一条深链。
+    """
+    site_url = site_config["url"]
+    checkin_url = f"{site_url}{site_config['checkin_path']}"
+    print("    [*] 先访问首页再进签到页重试一次...")
+    home_status = 0
+    try:
+        home = page.goto(site_url, wait_until="domcontentloaded", timeout=60000)
+        home_status = home.status if home is not None else 0
+    except Exception as e:
+        print(f"    [!] 首页没打开: {type(e).__name__}")
+    time.sleep(5)
+    att_status = 0
+    try:
+        resp2 = page.goto(checkin_url, wait_until="domcontentloaded", timeout=60000)
+        att_status = resp2.status if resp2 is not None else 0
+    except Exception as e:
+        print(f"    [!] 签到页没打开: {type(e).__name__}")
+    time.sleep(5)
+    verdict2, reason2 = classify_page(await_page_text(page), url_path_of(page),
+                                      page.title(), att_status)
+    print(f"    [DEBUG] 重试：首页 HTTP {home_status} / 签到页 HTTP {att_status} / 判定: {verdict2}")
+    if verdict2 == "success":
+        print(f"    [OK] 重试后确认已签到（{reason2}）")
+        return True
+    print(f"    [-] 签到未成功: {first_reason}；重试后 {reason2}")
+    return False
+
+
 def do_checkin(page, site_config: dict) -> bool:
     site_url = site_config["url"]
     checkin_url = f"{site_url}{site_config['checkin_path']}"
@@ -779,6 +856,9 @@ def do_checkin(page, site_config: dict) -> bool:
     if verdict == "success":
         print(f"    [OK] 签到状态已确认（{reason}）")
         return True
+    print(f"    [诊断] {_diag_page(page, resp)}")
+    if verdict in ("blocked", "waf"):
+        return _retry_after_home(page, site_config, reason)
     if verdict != "unknown":
         print(f"    [-] 签到未成功: {reason}")
         return False
