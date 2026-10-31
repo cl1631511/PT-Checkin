@@ -699,6 +699,10 @@ _PAGE_SHAPE_JS = """() => {
     const q = (s) => document.querySelectorAll(s).length;
     const href = (frag) => Array.from(document.querySelectorAll('a'))
         .filter(a => (a.href || '').indexOf(frag) >= 0).length;
+    const urls = (sel, key) => Array.from(document.querySelectorAll(sel)).map(e => {
+        try { const u = new URL(e[key] || '', location.href); return key === 'src' ? u.host : u.pathname; }
+        catch (err) { return ''; }
+    }).filter(Boolean).slice(0, 4).join(',');
     return {
         forms: q('form'), inputs: q('input'), links: q('a'),
         att_form: q('#attendance') + q('form[action*="attendance"]'),
@@ -708,6 +712,8 @@ _PAGE_SHAPE_JS = """() => {
                  + q('img[src*="imagecode"]') + q('img[src*="captcha"]'),
         pass_inputs: q('input[type="password"]'),
         iframes: q('iframe'),
+        frame_hosts: urls('iframe', 'src'),
+        form_actions: urls('form', 'action'),
         verify_widgets: q('.cf-turnstile') + q('[id*="cf-challenge"]')
                         + q('input[name*="turnstile"]') + q('input[name*="challenge-response"]')
                         + q('[class*="challenge"]') + q('[id*="seccode"]'),
@@ -766,6 +772,12 @@ def _diag_page(page, resp) -> str:
                 sh.get("att_form", "?"), sh.get("login_links", "?"),
                 sh.get("member_links", "?"), sh.get("iframes", "?"),
                 sh.get("verify_widgets", "?"), sh.get("buttons", "?")))
+        frames = str(sh.get("frame_hosts", ""))[:120]
+        acts = str(sh.get("form_actions", ""))[:80]
+        if frames:
+            parts.append(f"iframe域名={mask_personal(frames)}")
+        if acts:
+            parts.append(f"表单动作={mask_personal(acts)}")
         if sh.get("captcha") or sh.get("pass_inputs"):
             parts.append(f"验证码框={sh.get('captcha', 0)} 密码框={sh.get('pass_inputs', 0)}")
     return " / ".join(parts)

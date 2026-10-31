@@ -301,10 +301,21 @@ ok("登录链接1/会员链接0" in _d5, "「按登录态看是游客页」日�
 _d3 = checkin._diag_page(FakePage(_LEAK_BODY, shape=dict(_PIGGO_SEEN, captcha=1,
                                                          pass_inputs=1)), _Resp(200))
 ok("验证码框=1 密码框=1" in _d3, "有验证码框/密码框时单独点名（决定要不要走人工）")
+# 真跑一轮 piggo 回的形状：iframe=2、验证部件=0 —— 选择器数不到，说明那道闸在跨域的 frame
+# 里（JS 看不见别人家 frame 的内容）。这时候唯一还能报出来的身份信息是 frame 的来源域名。
+_d6 = checkin._diag_page(FakePage("请完成安全验证后再签到", title="猪猪 - Powered by NexusPHP",
+                                  shape=dict(_PIGGO_SEEN, iframes=2,
+                                             frame_hosts="cap.dun.163.com,x.203.0.113.9",
+                                             form_actions="/ajax.php")), _Resp(200))
+ok("cap.dun.163.com" in _d6, f"frame 的来源域名进诊断行 —— 是雷池/网易易盾/CF 一眼分开（{_d6}）")
+ok("203.0.113.9" not in _d6, "frame 域名里混了完整 IP 照样被抠掉")
+ok("表单动作=/ajax.php" in _d6, "表单提交到哪个路径也报出来（只有路径，没有查询串）")
+ok("iframe域名" not in _diag and "表单动作" not in _diag,
+   "没有 frame、没有表单时不多打出空字段")
 # 桩只回一个现成的 dict，所以 _PAGE_SHAPE_JS 里的选择器本身在这儿测不到（真浏览器才有）；
 # 但「JS 返回的键」和「诊断行读的键」两边各写一遍，改一边忘另一边是这里最可能的错，必须钉住
 import re as _re
-_js_keys = set(_re.findall(r"\b(\w+)\s*:\s*(?:q|href)\(", checkin._PAGE_SHAPE_JS))
+_js_keys = set(_re.findall(r"\b(\w+)\s*:\s*(?:q|href|urls)\(", checkin._PAGE_SHAPE_JS))
 _printed = set(_re.findall(r'sh\.get\(["\'](\w+)["\']', (ROOT / "checkin.py").read_text(encoding="utf-8")))
 ok(_js_keys == _printed and {"iframes", "verify_widgets", "buttons", "att_form"} <= _js_keys,
    f"形状脚本返回的键 == 诊断行读的键（JS={sorted(_js_keys)} 打印={sorted(_printed)}）")
